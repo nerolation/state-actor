@@ -1,0 +1,51 @@
+# Binaries
+state-actor
+stategen
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Go workspace file
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/dist/
+/bin/
+
+# Generated databases
+chaindata/
+/testdata/chaindata/
+*.db/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.log
+
+# Docker
+.docker/
+
+# Local config
+.env
+.env.local

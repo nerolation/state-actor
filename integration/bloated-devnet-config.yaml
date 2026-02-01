@@ -1,0 +1,15 @@
+# Minimal Ethereum devnet configuration for testing
+# Use with: kurtosis run github.com/ethpandaops/ethereum-package --args-file bloated-devnet-config.yaml
+
+participants:
+  - el_type: geth
+    el_image: ethereum/client-go:latest
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse:latest
+    count: 2
+
+network_params:
+  seconds_per_slot: 12
+
+additional_services:
+  - dora
