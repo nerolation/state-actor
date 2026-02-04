@@ -220,7 +220,10 @@ func TestStorageValueEncoding(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			encoded := encodeStorageValue(tc.value)
+			encoded, err := encodeStorageValue(tc.value)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
 			if string(encoded) != string(tc.expected) {
 				t.Errorf("Encoding mismatch for %s: got %x, want %x", tc.name, encoded, tc.expected)
 			}
@@ -615,6 +618,8 @@ func BenchmarkStorageValueEncoding(b *testing.B) {
 	value := common.HexToHash("0x000000000000000000000000000000000000000000000000000000000000abcd")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = encodeStorageValue(value)
+		if _, err := encodeStorageValue(value); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

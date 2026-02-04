@@ -15,8 +15,8 @@ const (
 	// TrieModeMPT uses the Merkle Patricia Trie (hexary, keccak256-based).
 	TrieModeMPT TrieMode = "mpt"
 
-	// TrieModeBinary uses the EIP-7864 binary trie (SHA256-based).
-	// Compatible with geth's --override.verkle=0 flag.
+	// TrieModeBinary uses the EIP-7864 binary trie.
+	// Compatible with geth's --override.verkle=0 flag (=0 is the activation block number).
 	TrieModeBinary TrieMode = "binary"
 )
 

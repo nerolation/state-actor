@@ -134,12 +134,14 @@ func WriteGenesisBlock(db ethdb.KeyValueStore, genesis *Genesis, stateRoot commo
 		return nil, fmt.Errorf("genesis has no chain config")
 	}
 
+	// Determine the chain config to persist. When binaryTrie is true, we
+	// enable EIP-7864 binary trie mode (legacy field name: EnableVerkleAtGenesis).
+	// We work on a copy so the caller's *Genesis is never mutated.
+	chainCfg := genesis.Config
 	if binaryTrie {
-		// Work on a copy to avoid mutating the caller's config.
-		// Legacy field name: EnableVerkleAtGenesis enables EIP-7864 binary trie mode.
 		cfgCopy := *genesis.Config
 		cfgCopy.EnableVerkleAtGenesis = true
-		genesis.Config = &cfgCopy
+		chainCfg = &cfgCopy
 	}
 
 	// Build the genesis block header
@@ -232,7 +234,7 @@ func WriteGenesisBlock(db ethdb.KeyValueStore, genesis *Genesis, stateRoot commo
 	rawdb.WriteHeadBlockHash(batch, block.Hash())
 	rawdb.WriteHeadFastBlockHash(batch, block.Hash())
 	rawdb.WriteHeadHeaderHash(batch, block.Hash())
-	rawdb.WriteChainConfig(batch, block.Hash(), genesis.Config)
+	rawdb.WriteChainConfig(batch, block.Hash(), chainCfg)
 
 	if err := batch.Write(); err != nil {
 		return nil, fmt.Errorf("failed to write genesis block: %w", err)

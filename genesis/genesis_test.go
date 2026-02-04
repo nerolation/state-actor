@@ -220,8 +220,13 @@ func TestWriteGenesisBlock(t *testing.T) {
 	chainConfig := rawdb.ReadChainConfig(db, block.Hash())
 	if chainConfig == nil {
 		t.Error("Chain config not found in database")
-	} else if chainConfig.ChainID.Cmp(big.NewInt(1337)) != 0 {
-		t.Errorf("Chain ID mismatch: got %s, want 1337", chainConfig.ChainID)
+	} else {
+		if chainConfig.ChainID.Cmp(big.NewInt(1337)) != 0 {
+			t.Errorf("Chain ID mismatch: got %s, want 1337", chainConfig.ChainID)
+		}
+		if chainConfig.EnableVerkleAtGenesis {
+			t.Error("EnableVerkleAtGenesis should be false when binaryTrie=false")
+		}
 	}
 
 	// 5. Block should be retrievable
@@ -315,6 +320,32 @@ func TestWriteGenesisBlockBinaryTrie(t *testing.T) {
 	}
 	if storedBlock.Root() != stateRoot {
 		t.Errorf("State root mismatch: got %s, want %s", storedBlock.Root().Hex(), stateRoot.Hex())
+	}
+}
+
+func TestWriteGenesisBlockBinaryTrieNoMutation(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	defer db.Close()
+
+	gen := sampleGenesis()
+	origConfig := gen.Config
+	origVerkle := gen.Config.EnableVerkleAtGenesis
+
+	stateRoot := common.HexToHash("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+
+	_, err := WriteGenesisBlock(db, gen, stateRoot, true)
+	if err != nil {
+		t.Fatalf("Failed to write genesis block: %v", err)
+	}
+
+	// The caller's Genesis.Config pointer must not have been replaced
+	if gen.Config != origConfig {
+		t.Error("WriteGenesisBlock replaced caller's genesis.Config pointer")
+	}
+	// The original ChainConfig must not have been mutated
+	if gen.Config.EnableVerkleAtGenesis != origVerkle {
+		t.Errorf("WriteGenesisBlock mutated caller's EnableVerkleAtGenesis: got %v, want %v",
+			gen.Config.EnableVerkleAtGenesis, origVerkle)
 	}
 }
 

@@ -35,6 +35,14 @@ type Generator struct {
 
 // New creates a new state generator.
 func New(config Config) (*Generator, error) {
+	// Validate trie mode
+	switch config.TrieMode {
+	case TrieModeMPT, TrieModeBinary, "":
+		// valid
+	default:
+		return nil, fmt.Errorf("unsupported trie mode: %q", config.TrieMode)
+	}
+
 	// Open Pebble database with reasonable cache settings
 	db, err := pebble.New(config.DBPath, 512, 256, "stategen/", false)
 	if err != nil {
@@ -287,13 +295,14 @@ func (g *Generator) generateSlotDistribution() []int {
 }
 
 // writeState dispatches to the appropriate trie-mode-specific writer.
-// Defaults to MPT for any unset or unrecognized TrieMode value.
 func (g *Generator) writeState(accounts, contracts []*accountData, stats *Stats) error {
 	switch g.config.TrieMode {
 	case TrieModeBinary:
 		return g.writeStateBinaryTrie(accounts, contracts, stats)
-	default: // TrieModeMPT or any unset value
+	case TrieModeMPT, "":
 		return g.writeStateMPT(accounts, contracts, stats)
+	default:
+		return fmt.Errorf("unsupported trie mode: %q", g.config.TrieMode)
 	}
 }
 
@@ -305,6 +314,7 @@ type batchWriter struct {
 	batchChan chan *batchWork
 	errChan   chan error
 	wg        sync.WaitGroup
+	closeOnce sync.Once
 	batch     ethdb.Batch
 	count     int
 
@@ -335,6 +345,7 @@ func newBatchWriter(db ethdb.KeyValueStore, batchSize, workers int) *batchWriter
 					select {
 					case bw.errChan <- err:
 					default:
+						log.Printf("ERROR: additional batch write failure (dropped): %v", err)
 					}
 					return
 				}
@@ -380,7 +391,7 @@ func (bw *batchWriter) finish() error {
 	if err := bw.flush(); err != nil {
 		return err
 	}
-	close(bw.batchChan)
+	bw.closeOnce.Do(func() { close(bw.batchChan) })
 	bw.wg.Wait()
 
 	select {
@@ -389,6 +400,13 @@ func (bw *batchWriter) finish() error {
 	default:
 	}
 	return nil
+}
+
+// close releases worker goroutines without flushing. Idempotent; safe to
+// call after finish() or on error paths.
+func (bw *batchWriter) close() {
+	bw.closeOnce.Do(func() { close(bw.batchChan) })
+	bw.wg.Wait()
 }
 
 // writeStateMPT writes all state to the database using a Merkle Patricia Trie.
@@ -404,6 +422,7 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 	})
 
 	bw := newBatchWriter(g.db, g.config.BatchSize, g.config.Workers)
+	defer bw.close()
 
 	// Process all accounts (EOAs and contracts) in sorted order
 	for _, acc := range allAccounts {
@@ -430,7 +449,10 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 
 			for _, kh := range storageKeys {
 				value := acc.storage[kh.key]
-				valueRLP := encodeStorageValue(value)
+				valueRLP, err := encodeStorageValue(value)
+				if err != nil {
+					return err
+				}
 
 				storageKey := storageSnapshotKey(acc.addrHash, kh.keyHash)
 				if err := bw.put(storageKey, valueRLP, &bw.storageBytes); err != nil {
@@ -489,8 +511,10 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 
 // writeStateBinaryTrie writes all state using the EIP-7864 binary trie for root computation.
 // The binary trie uses a single global tree (no per-account storage subtries).
-func (g *Generator) writeStateBinaryTrie(accounts, contracts []*accountData, stats *Stats) error {
-	// Set up BinaryTrie with in-memory backing store (used only for root computation).
+func (g *Generator) writeStateBinaryTrie(accounts, contracts []*accountData, stats *Stats) (retErr error) {
+	// Set up BinaryTrie with an ephemeral in-memory backing store. The trie
+	// nodes are used only for root hash computation and are not persisted —
+	// geth will rebuild the trie from snapshot data on startup.
 	// IsVerkle is a legacy geth field name. Setting it to true enables
 	// EIP-7864 binary trie mode, not the original Verkle trie design.
 	memDB := rawdb.NewMemoryDatabase()
@@ -500,8 +524,8 @@ func (g *Generator) writeStateBinaryTrie(accounts, contracts []*accountData, sta
 		PathDB:   pathdb.Defaults,
 	})
 	defer func() {
-		if err := trieDB.Close(); err != nil {
-			log.Printf("warning: failed to close trie database: %v", err)
+		if err := trieDB.Close(); err != nil && retErr == nil {
+			retErr = fmt.Errorf("failed to close trie database: %w", err)
 		}
 	}()
 
@@ -510,17 +534,17 @@ func (g *Generator) writeStateBinaryTrie(accounts, contracts []*accountData, sta
 		return fmt.Errorf("failed to create binary trie: %w", err)
 	}
 
-	// Merge all accounts — no sorting needed, binary trie handles arbitrary insertion order
+	// Merge all accounts (storage keys sorted per-account for determinism)
 	allAccounts := make([]*accountData, 0, len(accounts)+len(contracts))
 	allAccounts = append(allAccounts, accounts...)
 	allAccounts = append(allAccounts, contracts...)
 
 	bw := newBatchWriter(g.db, g.config.BatchSize, g.config.Workers)
+	defer bw.close()
 
 	for _, acc := range allAccounts {
 		// Insert into binary trie (handles key derivation + encoding internally)
-		codeLen := len(acc.code)
-		if err := bt.UpdateAccount(acc.address, acc.account, codeLen); err != nil {
+		if err := bt.UpdateAccount(acc.address, acc.account, len(acc.code)); err != nil {
 			return fmt.Errorf("binary trie UpdateAccount error: %w", err)
 		}
 
@@ -531,8 +555,18 @@ func (g *Generator) writeStateBinaryTrie(accounts, contracts []*accountData, sta
 			}
 		}
 
+		// Sort storage keys for deterministic insertion order
+		storageKeys := make([]common.Hash, 0, len(acc.storage))
+		for k := range acc.storage {
+			storageKeys = append(storageKeys, k)
+		}
+		sort.Slice(storageKeys, func(i, j int) bool {
+			return bytes.Compare(storageKeys[i][:], storageKeys[j][:]) < 0
+		})
+
 		// Insert storage slots into binary trie
-		for slotKey, slotValue := range acc.storage {
+		for _, slotKey := range storageKeys {
+			slotValue := acc.storage[slotKey]
 			if err := bt.UpdateStorage(acc.address, slotKey[:], slotValue[:]); err != nil {
 				return fmt.Errorf("binary trie UpdateStorage error: %w", err)
 			}
@@ -549,10 +583,14 @@ func (g *Generator) writeStateBinaryTrie(accounts, contracts []*accountData, sta
 			return fmt.Errorf("failed to write account snapshot for %s: %w", acc.address.Hex(), err)
 		}
 
-		// Storage snapshots (keccak256-keyed, same as MPT)
-		for slotKey, slotValue := range acc.storage {
+		// Storage snapshots (keccak256-keyed, same as MPT) — reuse sorted keys
+		for _, slotKey := range storageKeys {
+			slotValue := acc.storage[slotKey]
 			keyHash := crypto.Keccak256Hash(slotKey[:])
-			valueRLP := encodeStorageValue(slotValue)
+			valueRLP, err := encodeStorageValue(slotValue)
+			if err != nil {
+				return fmt.Errorf("failed to encode storage value for %s: %w", acc.address.Hex(), err)
+			}
 			storageKey := storageSnapshotKey(acc.addrHash, keyHash)
 			if err := bw.put(storageKey, valueRLP, &bw.storageBytes); err != nil {
 				return fmt.Errorf("failed to write storage snapshot for %s: %w", acc.address.Hex(), err)
@@ -569,7 +607,7 @@ func (g *Generator) writeStateBinaryTrie(accounts, contracts []*accountData, sta
 	}
 
 	if err := bw.finish(); err != nil {
-		return err
+		return fmt.Errorf("failed to finish binary trie batch writes: %w", err)
 	}
 
 	// Compute state root from binary trie
@@ -617,13 +655,16 @@ func codeKey(hash common.Hash) []byte {
 }
 
 // encodeStorageValue encodes a storage value using RLP with leading zeros trimmed.
-func encodeStorageValue(value common.Hash) []byte {
+func encodeStorageValue(value common.Hash) ([]byte, error) {
 	trimmed := trimLeftZeroes(value[:])
 	if len(trimmed) == 0 {
-		return nil
+		return nil, nil
 	}
-	encoded, _ := rlp.EncodeToBytes(trimmed)
-	return encoded
+	encoded, err := rlp.EncodeToBytes(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to RLP-encode storage value %x: %w", value, err)
+	}
+	return encoded, nil
 }
 
 func trimLeftZeroes(s []byte) []byte {
