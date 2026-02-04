@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -368,6 +369,245 @@ func benchmarkGenerate(b *testing.B, accounts, contracts, maxSlots int) {
 		b.ReportMetric(float64(stats.TotalBytes)/1024/1024, "MB")
 
 		os.RemoveAll(tmpDir)
+	}
+}
+
+// --- Binary Trie Tests ---
+
+func TestGenerateBinaryTrie(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "testdb")
+
+	config := Config{
+		DBPath:       dbPath,
+		NumAccounts:  10,
+		NumContracts: 5,
+		MaxSlots:     100,
+		MinSlots:     1,
+		Distribution: PowerLaw,
+		Seed:         12345,
+		BatchSize:    1000,
+		Workers:      1,
+		CodeSize:     256,
+		TrieMode:     TrieModeBinary,
+	}
+
+	gen, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create generator: %v", err)
+	}
+	defer gen.Close()
+
+	stats, err := gen.Generate()
+	if err != nil {
+		t.Fatalf("Failed to generate state: %v", err)
+	}
+
+	if stats.AccountsCreated != 10 {
+		t.Errorf("Expected 10 accounts, got %d", stats.AccountsCreated)
+	}
+	if stats.ContractsCreated != 5 {
+		t.Errorf("Expected 5 contracts, got %d", stats.ContractsCreated)
+	}
+	if stats.StateRoot == (common.Hash{}) {
+		t.Error("State root should not be empty")
+	}
+	if stats.TotalBytes == 0 {
+		t.Error("Total bytes should not be zero")
+	}
+
+	// Verify binary trie produces a different root than MPT with the same seed
+	mptDir := t.TempDir()
+	mptConfig := config
+	mptConfig.DBPath = filepath.Join(mptDir, "testdb-mpt")
+	mptConfig.TrieMode = TrieModeMPT
+
+	mptGen, err := New(mptConfig)
+	if err != nil {
+		t.Fatalf("Failed to create MPT generator: %v", err)
+	}
+	defer mptGen.Close()
+
+	mptStats, err := mptGen.Generate()
+	if err != nil {
+		t.Fatalf("Failed to generate MPT state: %v", err)
+	}
+
+	if stats.StateRoot == mptStats.StateRoot {
+		t.Error("Binary trie and MPT should produce different state roots with the same seed")
+	}
+}
+
+func TestDatabaseContentBinaryTrie(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "testdb")
+
+	config := Config{
+		DBPath:       dbPath,
+		NumAccounts:  3,
+		NumContracts: 2,
+		MaxSlots:     10,
+		MinSlots:     5,
+		Distribution: Uniform,
+		Seed:         99,
+		BatchSize:    100,
+		Workers:      1,
+		CodeSize:     64,
+		TrieMode:     TrieModeBinary,
+	}
+
+	gen, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create generator: %v", err)
+	}
+
+	stats, err := gen.Generate()
+	if err != nil {
+		t.Fatalf("Failed to generate state: %v", err)
+	}
+	gen.Close()
+
+	// Reopen and verify content
+	db, err := pebble.New(dbPath, 64, 64, "verify/", true)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer db.Close()
+
+	// Verify snapshot root
+	snapshotRootData, err := db.Get([]byte("SnapshotRoot"))
+	if err != nil {
+		t.Fatalf("Failed to read snapshot root: %v", err)
+	}
+	snapshotRoot := common.BytesToHash(snapshotRootData)
+	if snapshotRoot != stats.StateRoot {
+		t.Errorf("Snapshot root mismatch: got %s, want %s", snapshotRoot.Hex(), stats.StateRoot.Hex())
+	}
+
+	// Count account snapshots (prefix "a")
+	iter := db.NewIterator([]byte("a"), nil)
+	accountCount := 0
+	for iter.Next() {
+		// Decode slim account and verify Root == EmptyRootHash
+		// This is the key binary trie invariant: no per-account storage subtries
+		val := iter.Value()
+		acc, err := types.FullAccount(val)
+		if err != nil {
+			t.Fatalf("Failed to decode slim account: %v", err)
+		}
+		if acc.Root != types.EmptyRootHash {
+			t.Errorf("Binary trie account should have EmptyRootHash, got %s", acc.Root.Hex())
+		}
+		accountCount++
+	}
+	iter.Release()
+
+	expectedAccounts := config.NumAccounts + config.NumContracts
+	if accountCount != expectedAccounts {
+		t.Errorf("Expected %d accounts in DB, got %d", expectedAccounts, accountCount)
+	}
+
+	// Count storage snapshots (prefix "o")
+	iter = db.NewIterator([]byte("o"), nil)
+	storageCount := 0
+	for iter.Next() {
+		storageCount++
+	}
+	iter.Release()
+
+	if storageCount != stats.StorageSlotsCreated {
+		t.Errorf("Expected %d storage slots in DB, got %d", stats.StorageSlotsCreated, storageCount)
+	}
+
+	// Count code entries (prefix "c")
+	iter = db.NewIterator([]byte("c"), nil)
+	codeCount := 0
+	for iter.Next() {
+		codeCount++
+	}
+	iter.Release()
+
+	if codeCount != config.NumContracts {
+		t.Errorf("Expected %d code entries in DB, got %d", config.NumContracts, codeCount)
+	}
+}
+
+func TestBinaryTrieReproducibility(t *testing.T) {
+	var roots [2]common.Hash
+
+	for i := 0; i < 2; i++ {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "testdb")
+
+		config := Config{
+			DBPath:       dbPath,
+			NumAccounts:  10,
+			NumContracts: 5,
+			MaxSlots:     50,
+			MinSlots:     10,
+			Distribution: PowerLaw,
+			Seed:         54321,
+			BatchSize:    100,
+			Workers:      1,
+			CodeSize:     128,
+			TrieMode:     TrieModeBinary,
+		}
+
+		gen, err := New(config)
+		if err != nil {
+			t.Fatalf("Failed to create generator: %v", err)
+		}
+
+		stats, err := gen.Generate()
+		if err != nil {
+			t.Fatalf("Failed to generate state: %v", err)
+		}
+		gen.Close()
+
+		roots[i] = stats.StateRoot
+	}
+
+	if roots[0] != roots[1] {
+		t.Errorf("Binary trie state roots should be identical with same seed: %s != %s",
+			roots[0].Hex(), roots[1].Hex())
+	}
+}
+
+func TestBinaryTrieStateRootValue(t *testing.T) {
+	// Golden value test: pin the binary trie state root for a specific configuration.
+	// If the upstream bintrie API changes behavior, this test fails loudly.
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "testdb")
+
+	config := Config{
+		DBPath:       dbPath,
+		NumAccounts:  10,
+		NumContracts: 5,
+		MaxSlots:     100,
+		MinSlots:     1,
+		Distribution: PowerLaw,
+		Seed:         12345,
+		BatchSize:    1000,
+		Workers:      1,
+		CodeSize:     256,
+		TrieMode:     TrieModeBinary,
+	}
+
+	gen, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create generator: %v", err)
+	}
+	defer gen.Close()
+
+	stats, err := gen.Generate()
+	if err != nil {
+		t.Fatalf("Failed to generate state: %v", err)
+	}
+
+	expected := common.HexToHash("0x67a3c9d83262434a5bd54fce34928cc72a8fe4668a447b199a3c860904b5c52a")
+	if stats.StateRoot != expected {
+		t.Errorf("Binary trie state root mismatch:\n  got:  %s\n  want: %s\nThis may indicate an upstream bintrie API change.",
+			stats.StateRoot.Hex(), expected.Hex())
 	}
 }
 

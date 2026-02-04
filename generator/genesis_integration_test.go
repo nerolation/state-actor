@@ -148,6 +148,153 @@ func TestGenesisAccountsIntegration(t *testing.T) {
 	}
 }
 
+// TestGenesisAccountsIntegrationBinaryTrie tests that genesis alloc accounts
+// are properly included in binary trie state generation.
+func TestGenesisAccountsIntegrationBinaryTrie(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "chaindata")
+
+	genesisAccounts := map[common.Address]*types.StateAccount{
+		common.HexToAddress("0x1111111111111111111111111111111111111111"): {
+			Nonce:    0,
+			Balance:  uint256.NewInt(1e18),
+			Root:     types.EmptyRootHash,
+			CodeHash: types.EmptyCodeHash.Bytes(),
+		},
+		common.HexToAddress("0x2222222222222222222222222222222222222222"): {
+			Nonce:    5,
+			Balance:  uint256.NewInt(2e18),
+			Root:     types.EmptyRootHash,
+			CodeHash: crypto.Keccak256([]byte{0x60, 0x00}),
+		},
+	}
+
+	genesisStorage := map[common.Address]map[common.Hash]common.Hash{
+		common.HexToAddress("0x2222222222222222222222222222222222222222"): {
+			common.HexToHash("0x01"): common.HexToHash("0xdeadbeef"),
+			common.HexToHash("0x02"): common.HexToHash("0xcafe"),
+		},
+	}
+
+	genesisCode := map[common.Address][]byte{
+		common.HexToAddress("0x2222222222222222222222222222222222222222"): {0x60, 0x00},
+	}
+
+	config := Config{
+		DBPath:          dbPath,
+		NumAccounts:     10,
+		NumContracts:    5,
+		MaxSlots:        100,
+		MinSlots:        1,
+		Distribution:    PowerLaw,
+		Seed:            12345,
+		BatchSize:       1000,
+		Workers:         1,
+		CodeSize:        256,
+		Verbose:         false,
+		TrieMode:        TrieModeBinary,
+		GenesisAccounts: genesisAccounts,
+		GenesisStorage:  genesisStorage,
+		GenesisCode:     genesisCode,
+	}
+
+	gen, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create generator: %v", err)
+	}
+	defer gen.Close()
+
+	stats, err := gen.Generate()
+	if err != nil {
+		t.Fatalf("Failed to generate state: %v", err)
+	}
+
+	// Verify stats
+	expectedAccounts := 1 + 10 // 1 genesis EOA + 10 generated
+	expectedContracts := 1 + 5 // 1 genesis contract + 5 generated
+
+	if stats.AccountsCreated != expectedAccounts {
+		t.Errorf("Expected %d accounts, got %d", expectedAccounts, stats.AccountsCreated)
+	}
+	if stats.ContractsCreated != expectedContracts {
+		t.Errorf("Expected %d contracts, got %d", expectedContracts, stats.ContractsCreated)
+	}
+	if stats.StateRoot == (common.Hash{}) {
+		t.Error("State root should not be zero")
+	}
+	// Genesis contract has 2 storage slots
+	if stats.StorageSlotsCreated < 2 {
+		t.Errorf("Expected at least 2 storage slots from genesis, got %d", stats.StorageSlotsCreated)
+	}
+
+	// Verify genesis accounts are in the database
+	db := gen.DB()
+
+	addr1 := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	addrHash1 := crypto.Keccak256Hash(addr1[:])
+	data1, err := db.Get(append([]byte("a"), addrHash1[:]...))
+	if err != nil {
+		t.Errorf("Genesis EOA not found in database: %v", err)
+	}
+	if len(data1) == 0 {
+		t.Error("Genesis EOA data is empty")
+	}
+
+	addr2 := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	addrHash2 := crypto.Keccak256Hash(addr2[:])
+	data2, err := db.Get(append([]byte("a"), addrHash2[:]...))
+	if err != nil {
+		t.Errorf("Genesis contract not found in database: %v", err)
+	}
+	if len(data2) == 0 {
+		t.Error("Genesis contract data is empty")
+	}
+
+	// Verify storage slot
+	slotKey := common.HexToHash("0x01")
+	slotKeyHash := crypto.Keccak256Hash(slotKey[:])
+	storageKey := append([]byte("o"), addrHash2[:]...)
+	storageKey = append(storageKey, slotKeyHash[:]...)
+	storageData, err := db.Get(storageKey)
+	if err != nil {
+		t.Errorf("Genesis storage slot not found: %v", err)
+	}
+	if len(storageData) == 0 {
+		t.Error("Genesis storage slot data is empty")
+	}
+
+	// Verify code
+	codeHash := crypto.Keccak256Hash(genesisCode[addr2])
+	codeData, err := db.Get(append([]byte("c"), codeHash[:]...))
+	if err != nil {
+		t.Errorf("Genesis code not found: %v", err)
+	}
+	if string(codeData) != string(genesisCode[addr2]) {
+		t.Errorf("Genesis code mismatch: got %x, want %x", codeData, genesisCode[addr2])
+	}
+
+	// Verify root differs from MPT with same config
+	mptDir := t.TempDir()
+	mptConfig := config
+	mptConfig.DBPath = filepath.Join(mptDir, "chaindata")
+	mptConfig.TrieMode = TrieModeMPT
+
+	mptGen, err := New(mptConfig)
+	if err != nil {
+		t.Fatalf("Failed to create MPT generator: %v", err)
+	}
+	defer mptGen.Close()
+
+	mptStats, err := mptGen.Generate()
+	if err != nil {
+		t.Fatalf("Failed to generate MPT state: %v", err)
+	}
+
+	if stats.StateRoot == mptStats.StateRoot {
+		t.Error("Binary trie and MPT should produce different roots for same genesis config")
+	}
+}
+
 // TestGenesisAccountNoCollision verifies that generated accounts don't
 // collide with genesis accounts (extremely unlikely but we check anyway).
 func TestGenesisAccountNoCollision(t *testing.T) {

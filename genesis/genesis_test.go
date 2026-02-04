@@ -184,7 +184,7 @@ func TestWriteGenesisBlock(t *testing.T) {
 	// Use a deterministic state root for testing
 	stateRoot := common.HexToHash("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
 
-	block, err := WriteGenesisBlock(db, genesis, stateRoot)
+	block, err := WriteGenesisBlock(db, genesis, stateRoot, false)
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestWriteGenesisBlockWithShanghai(t *testing.T) {
 	genesis.Config.ShanghaiTime = &zero
 
 	stateRoot := common.HexToHash("0xabcd")
-	block, err := WriteGenesisBlock(db, genesis, stateRoot)
+	block, err := WriteGenesisBlock(db, genesis, stateRoot, false)
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestWriteGenesisBlockWithCancun(t *testing.T) {
 	genesis.Config.CancunTime = &zero
 
 	stateRoot := common.HexToHash("0xabcd")
-	block, err := WriteGenesisBlock(db, genesis, stateRoot)
+	block, err := WriteGenesisBlock(db, genesis, stateRoot, false)
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}
@@ -284,6 +284,37 @@ func TestWriteGenesisBlockWithCancun(t *testing.T) {
 	}
 	if header.ParentBeaconRoot == nil {
 		t.Error("Cancun genesis should have parent beacon root")
+	}
+}
+
+func TestWriteGenesisBlockBinaryTrie(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	defer db.Close()
+
+	genesis := sampleGenesis()
+	stateRoot := common.HexToHash("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+
+	block, err := WriteGenesisBlock(db, genesis, stateRoot, true)
+	if err != nil {
+		t.Fatalf("Failed to write genesis block: %v", err)
+	}
+
+	// Verify chain config was persisted with EnableVerkleAtGenesis
+	chainConfig := rawdb.ReadChainConfig(db, block.Hash())
+	if chainConfig == nil {
+		t.Fatal("Chain config not found in database")
+	}
+	if !chainConfig.EnableVerkleAtGenesis {
+		t.Error("EnableVerkleAtGenesis should be true for binary trie mode")
+	}
+
+	// Verify block is readable
+	storedBlock := rawdb.ReadBlock(db, block.Hash(), 0)
+	if storedBlock == nil {
+		t.Error("Genesis block not found in database")
+	}
+	if storedBlock.Root() != stateRoot {
+		t.Errorf("State root mismatch: got %s, want %s", storedBlock.Root().Hex(), stateRoot.Hex())
 	}
 }
 

@@ -115,7 +115,7 @@ func TestEndToEndWithGenesis(t *testing.T) {
 	}
 
 	// Write genesis block
-	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot)
+	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot, false)
 	if err != nil {
 		stateGen.Close()
 		t.Fatalf("Failed to write genesis block: %v", err)
@@ -204,6 +204,164 @@ func TestEndToEndWithGenesis(t *testing.T) {
 	}
 }
 
+// TestEndToEndWithGenesisBinaryTrie tests the complete workflow with binary trie mode:
+// 1. Load a genesis file
+// 2. Generate state with TrieModeBinary
+// 3. Write genesis block with binaryTrie=true
+// 4. Verify database is complete with correct config
+func TestEndToEndWithGenesisBinaryTrie(t *testing.T) {
+	genesisJSON := `{
+		"config": {
+			"chainId": 32382,
+			"homesteadBlock": 0,
+			"eip150Block": 0,
+			"eip155Block": 0,
+			"eip158Block": 0,
+			"byzantiumBlock": 0,
+			"constantinopleBlock": 0,
+			"petersburgBlock": 0,
+			"istanbulBlock": 0,
+			"berlinBlock": 0,
+			"londonBlock": 0,
+			"mergeNetsplitBlock": 0,
+			"shanghaiTime": 0,
+			"cancunTime": 0,
+			"terminalTotalDifficulty": 0
+		},
+		"nonce": "0x0",
+		"timestamp": "0x0",
+		"extraData": "0x",
+		"gasLimit": "0x1c9c380",
+		"difficulty": "0x0",
+		"mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+		"coinbase": "0x0000000000000000000000000000000000000000",
+		"alloc": {
+			"0x123463a4b065722e99115d6c222f267d9cabb524": {
+				"balance": "0x43c33c1937564800000"
+			},
+			"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef": {
+				"code": "0x6000",
+				"balance": "0x0",
+				"nonce": "0x1",
+				"storage": {
+					"0x0000000000000000000000000000000000000000000000000000000000000001": "0x0000000000000000000000000000000000000000000000000000000000000042"
+				}
+			}
+		},
+		"number": "0x0",
+		"gasUsed": "0x0",
+		"parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+	}`
+
+	dir := t.TempDir()
+	genesisPath := filepath.Join(dir, "genesis.json")
+	dbPath := filepath.Join(dir, "chaindata")
+
+	if err := os.WriteFile(genesisPath, []byte(genesisJSON), 0644); err != nil {
+		t.Fatalf("Failed to write genesis file: %v", err)
+	}
+
+	gen, err := genesis.LoadGenesis(genesisPath)
+	if err != nil {
+		t.Fatalf("Failed to load genesis: %v", err)
+	}
+
+	config := generator.Config{
+		DBPath:          dbPath,
+		NumAccounts:     50,
+		NumContracts:    20,
+		MaxSlots:        100,
+		MinSlots:        5,
+		Distribution:    generator.PowerLaw,
+		Seed:            12345,
+		BatchSize:       10000,
+		Workers:         1,
+		CodeSize:        256,
+		Verbose:         false,
+		TrieMode:        generator.TrieModeBinary,
+		GenesisAccounts: gen.ToStateAccounts(),
+		GenesisStorage:  gen.GetAllocStorage(),
+		GenesisCode:     gen.GetAllocCode(),
+	}
+
+	stateGen, err := generator.New(config)
+	if err != nil {
+		t.Fatalf("Failed to create generator: %v", err)
+	}
+
+	stats, err := stateGen.Generate()
+	if err != nil {
+		stateGen.Close()
+		t.Fatalf("Failed to generate state: %v", err)
+	}
+
+	// Write genesis block with binary trie enabled
+	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot, true)
+	if err != nil {
+		stateGen.Close()
+		t.Fatalf("Failed to write genesis block: %v", err)
+	}
+	stateGen.Close()
+
+	t.Logf("Binary trie e2e: root=%s block=%s", stats.StateRoot.Hex(), block.Hash().Hex())
+
+	// Verify state root is non-zero
+	if stats.StateRoot == (common.Hash{}) {
+		t.Error("State root should not be zero")
+	}
+
+	// Reopen and verify
+	db, err := pebble.New(dbPath, 128, 64, "verify/", true)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer db.Close()
+
+	// Verify genesis accounts
+	for _, addr := range []common.Address{
+		common.HexToAddress("0x123463a4b065722e99115d6c222f267d9cabb524"),
+		common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+	} {
+		addrHash := crypto.Keccak256Hash(addr[:])
+		key := append([]byte("a"), addrHash[:]...)
+		data, err := db.Get(key)
+		if err != nil {
+			t.Errorf("Account %s not found: %v", addr.Hex(), err)
+			continue
+		}
+		if len(data) == 0 {
+			t.Errorf("Account %s has empty data", addr.Hex())
+		}
+	}
+
+	// Verify SnapshotRoot
+	snapshotRoot, err := db.Get([]byte("SnapshotRoot"))
+	if err != nil {
+		t.Errorf("SnapshotRoot not found: %v", err)
+	} else if common.BytesToHash(snapshotRoot) != stats.StateRoot {
+		t.Errorf("SnapshotRoot mismatch: got %x, want %s", snapshotRoot, stats.StateRoot.Hex())
+	}
+
+	// Verify chain config has EnableVerkleAtGenesis
+	chainConfig := rawdb.ReadChainConfig(db, block.Hash())
+	if chainConfig == nil {
+		t.Error("Chain config not found")
+	} else if !chainConfig.EnableVerkleAtGenesis {
+		t.Error("Chain config should have EnableVerkleAtGenesis=true for binary trie mode")
+	}
+
+	// Verify expected counts
+	expectedAccounts := 1 + 50 // 1 genesis EOA + 50 generated
+	expectedContracts := 1 + 20 // 1 genesis contract + 20 generated
+
+	if stats.AccountsCreated != expectedAccounts {
+		t.Errorf("Account count mismatch: got %d, want %d", stats.AccountsCreated, expectedAccounts)
+	}
+	if stats.ContractsCreated != expectedContracts {
+		t.Errorf("Contract count mismatch: got %d, want %d", stats.ContractsCreated, expectedContracts)
+	}
+}
+
 // TestDatabaseReadableByRawDB tests that the generated database can be read
 // using geth's rawdb functions (requires ethdb.Database interface).
 func TestDatabaseReadableByRawDB(t *testing.T) {
@@ -241,7 +399,7 @@ func TestDatabaseReadableByRawDB(t *testing.T) {
 
 	// Write a genesis block
 	stateRoot := common.HexToHash("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
-	block, err := genesis.WriteGenesisBlock(db, &gen, stateRoot)
+	block, err := genesis.WriteGenesisBlock(db, &gen, stateRoot, false)
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}
