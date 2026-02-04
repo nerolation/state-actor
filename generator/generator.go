@@ -13,12 +13,16 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
+	"github.com/ethereum/go-ethereum/trie/bintrie"
+	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"github.com/holiman/uint256"
 )
 
@@ -282,40 +286,54 @@ func (g *Generator) generateSlotDistribution() []int {
 	return distribution
 }
 
-// writeState writes all state to the database.
+// writeState dispatches to the appropriate trie-mode-specific writer.
+// Defaults to MPT for any unset or unrecognized TrieMode value.
 func (g *Generator) writeState(accounts, contracts []*accountData, stats *Stats) error {
-	// Use a stack trie for computing the state root
-	accountTrie := trie.NewStackTrie(nil)
-	
-	// Merge and sort all accounts by address hash for deterministic trie construction
-	allAccounts := make([]*accountData, 0, len(accounts)+len(contracts))
-	allAccounts = append(allAccounts, accounts...)
-	allAccounts = append(allAccounts, contracts...)
-	sort.Slice(allAccounts, func(i, j int) bool {
-		return bytes.Compare(allAccounts[i].addrHash[:], allAccounts[j].addrHash[:]) < 0
-	})
-	
-	// Process in batches using workers
-	var wg sync.WaitGroup
-	var accountBytes, storageBytes, codeBytes atomic.Uint64
-	
-	// Channel for batch work
-	type batchWork struct {
-		batch ethdb.Batch
+	switch g.config.TrieMode {
+	case TrieModeBinary:
+		return g.writeStateBinaryTrie(accounts, contracts, stats)
+	default: // TrieModeMPT or any unset value
+		return g.writeStateMPT(accounts, contracts, stats)
 	}
-	
-	batchChan := make(chan *batchWork, g.config.Workers*2)
-	errChan := make(chan error, 1)
-	
-	// Start batch writer workers
-	for i := 0; i < g.config.Workers; i++ {
-		wg.Add(1)
+}
+
+// batchWriter encapsulates the parallel batch writing infrastructure
+// shared by both MPT and binary trie state writers.
+type batchWriter struct {
+	db        ethdb.KeyValueStore
+	batchSize int
+	batchChan chan *batchWork
+	errChan   chan error
+	wg        sync.WaitGroup
+	batch     ethdb.Batch
+	count     int
+
+	accountBytes atomic.Uint64
+	storageBytes atomic.Uint64
+	codeBytes    atomic.Uint64
+}
+
+type batchWork struct {
+	batch ethdb.Batch
+}
+
+func newBatchWriter(db ethdb.KeyValueStore, batchSize, workers int) *batchWriter {
+	bw := &batchWriter{
+		db:        db,
+		batchSize: batchSize,
+		batchChan: make(chan *batchWork, workers*2),
+		errChan:   make(chan error, 1),
+		batch:     db.NewBatch(),
+	}
+
+	for i := 0; i < workers; i++ {
+		bw.wg.Add(1)
 		go func() {
-			defer wg.Done()
-			for work := range batchChan {
+			defer bw.wg.Done()
+			for work := range bw.batchChan {
 				if err := work.batch.Write(); err != nil {
 					select {
-					case errChan <- err:
+					case bw.errChan <- err:
 					default:
 					}
 					return
@@ -324,26 +342,75 @@ func (g *Generator) writeState(accounts, contracts []*accountData, stats *Stats)
 		}()
 	}
 
-	batch := g.db.NewBatch()
-	batchCount := 0
-	
-	// Helper to flush batch
-	flushBatch := func() error {
-		if batchCount == 0 {
-			return nil
-		}
-		batchChan <- &batchWork{batch: batch}
-		batch = g.db.NewBatch()
-		batchCount = 0
+	return bw
+}
+
+// put writes a key-value pair and tracks bytes under the given counter.
+// Automatically flushes when batch size is reached.
+func (bw *batchWriter) put(key, value []byte, counter *atomic.Uint64) error {
+	if err := bw.batch.Put(key, value); err != nil {
+		return err
+	}
+	counter.Add(uint64(len(key) + len(value)))
+	bw.count++
+	if bw.count >= bw.batchSize {
+		return bw.flush()
+	}
+	return nil
+}
+
+// flush sends the current batch to workers. Uses select to detect worker
+// errors early and avoid deadlocking if all workers have exited.
+func (bw *batchWriter) flush() error {
+	if bw.count == 0 {
 		return nil
 	}
-	
+	select {
+	case bw.batchChan <- &batchWork{batch: bw.batch}:
+	case err := <-bw.errChan:
+		return fmt.Errorf("batch worker failed: %w", err)
+	}
+	bw.batch = bw.db.NewBatch()
+	bw.count = 0
+	return nil
+}
+
+// finish flushes remaining data, waits for workers, and checks for errors.
+func (bw *batchWriter) finish() error {
+	if err := bw.flush(); err != nil {
+		return err
+	}
+	close(bw.batchChan)
+	bw.wg.Wait()
+
+	select {
+	case err := <-bw.errChan:
+		return err
+	default:
+	}
+	return nil
+}
+
+// writeStateMPT writes all state to the database using a Merkle Patricia Trie.
+func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Stats) error {
+	accountTrie := trie.NewStackTrie(nil)
+
+	// Merge and sort all accounts by address hash for deterministic trie construction
+	allAccounts := make([]*accountData, 0, len(accounts)+len(contracts))
+	allAccounts = append(allAccounts, accounts...)
+	allAccounts = append(allAccounts, contracts...)
+	sort.Slice(allAccounts, func(i, j int) bool {
+		return bytes.Compare(allAccounts[i].addrHash[:], allAccounts[j].addrHash[:]) < 0
+	})
+
+	bw := newBatchWriter(g.db, g.config.BatchSize, g.config.Workers)
+
 	// Process all accounts (EOAs and contracts) in sorted order
 	for _, acc := range allAccounts {
 		// Process storage for contracts
 		if len(acc.storage) > 0 {
 			storageTrie := trie.NewStackTrie(nil)
-			
+
 			// Collect storage keys with their hashes
 			type keyWithHash struct {
 				key     common.Hash
@@ -360,84 +427,52 @@ func (g *Generator) writeState(accounts, contracts []*accountData, stats *Stats)
 			sort.Slice(storageKeys, func(i, j int) bool {
 				return bytes.Compare(storageKeys[i].keyHash[:], storageKeys[j].keyHash[:]) < 0
 			})
-			
+
 			for _, kh := range storageKeys {
 				value := acc.storage[kh.key]
 				valueRLP := encodeStorageValue(value)
-				
-				// Write storage snapshot
+
 				storageKey := storageSnapshotKey(acc.addrHash, kh.keyHash)
-				if err := batch.Put(storageKey, valueRLP); err != nil {
+				if err := bw.put(storageKey, valueRLP, &bw.storageBytes); err != nil {
 					return err
 				}
-				storageBytes.Add(uint64(len(storageKey) + len(valueRLP)))
-				
+
 				storageTrie.Update(kh.keyHash[:], valueRLP)
-				
-				batchCount++
-				if batchCount >= g.config.BatchSize {
-					if err := flushBatch(); err != nil {
-						return err
-					}
-				}
 			}
-			
+
 			// Update account's storage root
 			acc.account.Root = storageTrie.Hash()
 		}
-		
+
 		// Write contract code if present
 		if len(acc.code) > 0 {
 			cKey := codeKey(acc.codeHash)
-			if err := batch.Put(cKey, acc.code); err != nil {
+			if err := bw.put(cKey, acc.code, &bw.codeBytes); err != nil {
 				return err
 			}
-			codeBytes.Add(uint64(len(cKey) + len(acc.code)))
-			batchCount++
 		}
-		
+
 		// Write account snapshot
 		slimData := types.SlimAccountRLP(*acc.account)
 		key := accountSnapshotKey(acc.addrHash)
-		if err := batch.Put(key, slimData); err != nil {
+		if err := bw.put(key, slimData, &bw.accountBytes); err != nil {
 			return err
 		}
-		accountBytes.Add(uint64(len(key) + len(slimData)))
-		
+
 		// Add to account trie
 		accountTrie.Update(acc.addrHash[:], slimData)
-		
-		batchCount++
-		if batchCount >= g.config.BatchSize {
-			if err := flushBatch(); err != nil {
-				return err
-			}
-		}
 	}
 
-	// Flush remaining batch
-	if err := flushBatch(); err != nil {
+	if err := bw.finish(); err != nil {
 		return err
-	}
-	
-	// Close batch channel and wait for workers
-	close(batchChan)
-	wg.Wait()
-	
-	// Check for errors
-	select {
-	case err := <-errChan:
-		return err
-	default:
 	}
 
 	// Compute and store state root
 	stateRoot := accountTrie.Hash()
 	stats.StateRoot = stateRoot
-	
+
 	// Write snapshot root marker
-	snapshotRootKey := []byte("SnapshotRoot")
-	if err := g.db.Put(snapshotRootKey, stateRoot[:]); err != nil {
+	if err := g.db.Put([]byte("SnapshotRoot"), stateRoot[:]); err != nil {
 		return fmt.Errorf("failed to write snapshot root: %w", err)
 	}
 
@@ -445,9 +480,114 @@ func (g *Generator) writeState(accounts, contracts []*accountData, stats *Stats)
 		log.Printf("State root: %s", stateRoot.Hex())
 	}
 
-	stats.AccountBytes = accountBytes.Load()
-	stats.StorageBytes = storageBytes.Load()
-	stats.CodeBytes = codeBytes.Load()
+	stats.AccountBytes = bw.accountBytes.Load()
+	stats.StorageBytes = bw.storageBytes.Load()
+	stats.CodeBytes = bw.codeBytes.Load()
+
+	return nil
+}
+
+// writeStateBinaryTrie writes all state using the EIP-7864 binary trie for root computation.
+// The binary trie uses a single global tree (no per-account storage subtries).
+func (g *Generator) writeStateBinaryTrie(accounts, contracts []*accountData, stats *Stats) error {
+	// Set up BinaryTrie with in-memory backing store (used only for root computation).
+	// IsVerkle is a legacy geth field name. Setting it to true enables
+	// EIP-7864 binary trie mode, not the original Verkle trie design.
+	memDB := rawdb.NewMemoryDatabase()
+	defer memDB.Close()
+	trieDB := triedb.NewDatabase(memDB, &triedb.Config{
+		IsVerkle: true,
+		PathDB:   pathdb.Defaults,
+	})
+	defer func() {
+		if err := trieDB.Close(); err != nil {
+			log.Printf("warning: failed to close trie database: %v", err)
+		}
+	}()
+
+	bt, err := bintrie.NewBinaryTrie(types.EmptyBinaryHash, trieDB)
+	if err != nil {
+		return fmt.Errorf("failed to create binary trie: %w", err)
+	}
+
+	// Merge all accounts — no sorting needed, binary trie handles arbitrary insertion order
+	allAccounts := make([]*accountData, 0, len(accounts)+len(contracts))
+	allAccounts = append(allAccounts, accounts...)
+	allAccounts = append(allAccounts, contracts...)
+
+	bw := newBatchWriter(g.db, g.config.BatchSize, g.config.Workers)
+
+	for _, acc := range allAccounts {
+		// Insert into binary trie (handles key derivation + encoding internally)
+		codeLen := len(acc.code)
+		if err := bt.UpdateAccount(acc.address, acc.account, codeLen); err != nil {
+			return fmt.Errorf("binary trie UpdateAccount error: %w", err)
+		}
+
+		// Insert contract code into binary trie (handles chunking internally)
+		if len(acc.code) > 0 {
+			if err := bt.UpdateContractCode(acc.address, acc.codeHash, acc.code); err != nil {
+				return fmt.Errorf("binary trie UpdateContractCode error: %w", err)
+			}
+		}
+
+		// Insert storage slots into binary trie
+		for slotKey, slotValue := range acc.storage {
+			if err := bt.UpdateStorage(acc.address, slotKey[:], slotValue[:]); err != nil {
+				return fmt.Errorf("binary trie UpdateStorage error: %w", err)
+			}
+		}
+
+		// Write snapshot entries to Pebble (same format as MPT path).
+		// In binary trie mode, Account.Root is always EmptyRootHash since
+		// there are no per-account storage subtries.
+		snapshotAcc := *acc.account
+		snapshotAcc.Root = types.EmptyRootHash
+		slimData := types.SlimAccountRLP(snapshotAcc)
+		key := accountSnapshotKey(acc.addrHash)
+		if err := bw.put(key, slimData, &bw.accountBytes); err != nil {
+			return fmt.Errorf("failed to write account snapshot for %s: %w", acc.address.Hex(), err)
+		}
+
+		// Storage snapshots (keccak256-keyed, same as MPT)
+		for slotKey, slotValue := range acc.storage {
+			keyHash := crypto.Keccak256Hash(slotKey[:])
+			valueRLP := encodeStorageValue(slotValue)
+			storageKey := storageSnapshotKey(acc.addrHash, keyHash)
+			if err := bw.put(storageKey, valueRLP, &bw.storageBytes); err != nil {
+				return fmt.Errorf("failed to write storage snapshot for %s: %w", acc.address.Hex(), err)
+			}
+		}
+
+		// Code (same format as MPT)
+		if len(acc.code) > 0 {
+			cKey := codeKey(acc.codeHash)
+			if err := bw.put(cKey, acc.code, &bw.codeBytes); err != nil {
+				return fmt.Errorf("failed to write code for %s: %w", acc.address.Hex(), err)
+			}
+		}
+	}
+
+	if err := bw.finish(); err != nil {
+		return err
+	}
+
+	// Compute state root from binary trie
+	stateRoot := bt.Hash()
+	stats.StateRoot = stateRoot
+
+	// Write snapshot root marker
+	if err := g.db.Put([]byte("SnapshotRoot"), stateRoot[:]); err != nil {
+		return fmt.Errorf("failed to write snapshot root: %w", err)
+	}
+
+	if g.config.Verbose {
+		log.Printf("State root (binary trie): %s", stateRoot.Hex())
+	}
+
+	stats.AccountBytes = bw.accountBytes.Load()
+	stats.StorageBytes = bw.storageBytes.Load()
+	stats.CodeBytes = bw.codeBytes.Load()
 
 	return nil
 }

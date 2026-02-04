@@ -37,6 +37,7 @@ var (
 	codeSize     = flag.Int("code-size", 1024, "Average contract code size in bytes")
 	verbose      = flag.Bool("verbose", false, "Verbose output")
 	benchmark    = flag.Bool("benchmark", false, "Run in benchmark mode (print detailed stats)")
+	binaryTrie   = flag.Bool("binary-trie", false, "Generate state for binary trie mode (EIP-7864)")
 
 	// Genesis integration
 	genesisPath = flag.String("genesis", "", "Path to genesis.json file (optional)")
@@ -59,6 +60,11 @@ func main() {
 		*seed = time.Now().UnixNano()
 	}
 
+	trieMode := generator.TrieModeMPT
+	if *binaryTrie {
+		trieMode = generator.TrieModeBinary
+	}
+
 	config := generator.Config{
 		DBPath:       *dbPath,
 		NumAccounts:  *accounts,
@@ -71,6 +77,7 @@ func main() {
 		Workers:      *workers,
 		CodeSize:     *codeSize,
 		Verbose:      *verbose,
+		TrieMode:     trieMode,
 	}
 
 	// Load genesis if provided
@@ -104,6 +111,7 @@ func main() {
 		log.Printf("  Batch Size:   %d", config.BatchSize)
 		log.Printf("  Workers:      %d", config.Workers)
 		log.Printf("  Code Size:    %d bytes", config.CodeSize)
+		log.Printf("  Trie Mode:    %s", config.TrieMode)
 		if *genesisPath != "" {
 			log.Printf("  Genesis:      %s", *genesisPath)
 		}
@@ -128,7 +136,7 @@ func main() {
 			log.Printf("Writing genesis block with state root: %s", stats.StateRoot.Hex())
 		}
 
-		block, err := genesis.WriteGenesisBlock(gen.DB(), genesisConfig, stats.StateRoot)
+		block, err := genesis.WriteGenesisBlock(gen.DB(), genesisConfig, stats.StateRoot, config.TrieMode == generator.TrieModeBinary)
 		if err != nil {
 			log.Fatalf("Failed to write genesis block: %v", err)
 		}

@@ -15,7 +15,6 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/holiman/uint256"
 )
@@ -128,9 +127,19 @@ func (g *Genesis) GetAllocCode() map[common.Address][]byte {
 
 // WriteGenesisBlock writes the genesis block and associated metadata to the database.
 // This is called after state generation with the computed state root.
-func WriteGenesisBlock(db ethdb.KeyValueStore, genesis *Genesis, stateRoot common.Hash) (*types.Block, error) {
+// When binaryTrie is true, EnableVerkleAtGenesis is set in the chain config
+// (legacy field name — it actually enables binary trie mode per EIP-7864).
+func WriteGenesisBlock(db ethdb.KeyValueStore, genesis *Genesis, stateRoot common.Hash, binaryTrie bool) (*types.Block, error) {
 	if genesis.Config == nil {
 		return nil, fmt.Errorf("genesis has no chain config")
+	}
+
+	if binaryTrie {
+		// Work on a copy to avoid mutating the caller's config.
+		// Legacy field name: EnableVerkleAtGenesis enables EIP-7864 binary trie mode.
+		cfgCopy := *genesis.Config
+		cfgCopy.EnableVerkleAtGenesis = true
+		genesis.Config = &cfgCopy
 	}
 
 	// Build the genesis block header
@@ -230,23 +239,4 @@ func WriteGenesisBlock(db ethdb.KeyValueStore, genesis *Genesis, stateRoot commo
 	}
 
 	return block, nil
-}
-
-// encodeStorageValue encodes a storage value using RLP with leading zeros trimmed.
-func encodeStorageValue(value common.Hash) []byte {
-	trimmed := trimLeftZeroes(value[:])
-	if len(trimmed) == 0 {
-		return nil
-	}
-	encoded, _ := rlp.EncodeToBytes(trimmed)
-	return encoded
-}
-
-func trimLeftZeroes(s []byte) []byte {
-	for i, v := range s {
-		if v != 0 {
-			return s[i:]
-		}
-	}
-	return nil
 }

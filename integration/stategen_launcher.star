@@ -13,6 +13,7 @@ def generate_bloated_state(
     min_slots=100,
     distribution="power-law",
     seed=0,
+    binary_trie=False,
     tolerations=[],
     node_selectors={},
 ):
@@ -30,6 +31,7 @@ def generate_bloated_state(
         min_slots: Minimum storage slots per contract
         distribution: Storage distribution (power-law, uniform, exponential)
         seed: Random seed for reproducibility (0 = random)
+        binary_trie: Enable binary trie mode (EIP-7864, requires geth --override.verkle=0)
         tolerations: Kubernetes tolerations
         node_selectors: Kubernetes node selectors
     
@@ -40,7 +42,11 @@ def generate_bloated_state(
     seed_arg = ""
     if seed != 0:
         seed_arg = "--seed {0}".format(seed)
-    
+
+    binary_trie_arg = ""
+    if binary_trie:
+        binary_trie_arg = "--binary-trie"
+
     genesis_arg = ""
     files = {}
     if genesis_artifact != None:
@@ -57,6 +63,7 @@ def generate_bloated_state(
         --min-slots {min_slots} \
         --distribution {distribution} \
         {seed_arg} \
+        {binary_trie_arg} \
         --batch-size 50000 \
         --verbose \
         --benchmark
@@ -68,6 +75,7 @@ def generate_bloated_state(
         min_slots=min_slots,
         distribution=distribution,
         seed_arg=seed_arg,
+        binary_trie_arg=binary_trie_arg,
     )
     
     result = plan.run_sh(
@@ -114,6 +122,7 @@ def new_bloated_state_config(
     min_slots=100,
     distribution="power-law",
     seed=0,
+    binary_trie=False,
 ):
     """
     Creates a configuration struct for bloated state generation.
@@ -125,4 +134,14 @@ def new_bloated_state_config(
         min_slots=min_slots,
         distribution=distribution,
         seed=seed,
+        binary_trie=binary_trie,
     )
+
+
+def get_binary_trie_params():
+    """
+    Returns the geth extra params needed for binary trie mode.
+    Add these to el_extra_params when using binary trie state.
+    """
+    # Legacy geth flag name; --override.verkle=0 enables EIP-7864 binary trie mode
+    return ["--override.verkle=0"]
