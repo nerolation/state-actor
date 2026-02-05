@@ -37,7 +37,8 @@ var (
 	codeSize     = flag.Int("code-size", 1024, "Average contract code size in bytes")
 	verbose      = flag.Bool("verbose", false, "Verbose output")
 	benchmark    = flag.Bool("benchmark", false, "Run in benchmark mode (print detailed stats)")
-	binaryTrie   = flag.Bool("binary-trie", false, "Generate state for binary trie mode (EIP-7864)")
+	binaryTrie     = flag.Bool("binary-trie", false, "Generate state for binary trie mode (EIP-7864)")
+	commitInterval = flag.Int("commit-interval", 0, "Binary trie: commit to disk every N accounts (0 = all in-memory)")
 
 	// Genesis integration
 	genesisPath = flag.String("genesis", "", "Path to genesis.json file (optional)")
@@ -76,8 +77,9 @@ func main() {
 		BatchSize:    *batchSize,
 		Workers:      *workers,
 		CodeSize:     *codeSize,
-		Verbose:      *verbose,
-		TrieMode:     trieMode,
+		Verbose:        *verbose,
+		TrieMode:       trieMode,
+		CommitInterval: *commitInterval,
 	}
 
 	// Load genesis if provided
@@ -112,6 +114,9 @@ func main() {
 		log.Printf("  Workers:      %d", config.Workers)
 		log.Printf("  Code Size:    %d bytes", config.CodeSize)
 		log.Printf("  Trie Mode:    %s", config.TrieMode)
+		if config.CommitInterval > 0 {
+			log.Printf("  Commit Interval: %d accounts", config.CommitInterval)
+		}
 		if *genesisPath != "" {
 			log.Printf("  Genesis:      %s", *genesisPath)
 		}

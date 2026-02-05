@@ -96,6 +96,13 @@ type Config struct {
 
 	// GenesisCode is the code for genesis alloc accounts.
 	GenesisCode map[common.Address][]byte
+
+	// CommitInterval is the number of accounts between binary trie commits
+	// to disk. Only used in TrieModeBinary. 0 means no intermediate commits
+	// (entire trie stays in memory). When set, the trie is periodically
+	// committed to a temporary Pebble database and reopened, bounding memory
+	// to the working set between commits (~1-2 GB) instead of the full trie.
+	CommitInterval int
 }
 
 // Stats holds statistics about the generation process.

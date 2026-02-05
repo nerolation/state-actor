@@ -614,6 +614,125 @@ func TestBinaryTrieStateRootValue(t *testing.T) {
 	}
 }
 
+// --- Incremental Commit Tests ---
+
+// TestBinaryTrieCommitIntervalRootEquivalence verifies that incremental
+// disk-backed commits produce the exact same state root as the default
+// all-in-memory approach. This is the key correctness invariant for the
+// CommitInterval feature: the commit→reopen→continue cycle must not alter
+// the final trie hash.
+func TestBinaryTrieCommitIntervalRootEquivalence(t *testing.T) {
+	// Use a configuration with enough accounts and contracts that multiple
+	// commit cycles are triggered at CommitInterval=5.
+	baseConfig := Config{
+		NumAccounts:  100,
+		NumContracts: 10,
+		MaxSlots:     50,
+		MinSlots:     1,
+		Distribution: PowerLaw,
+		Seed:         7777,
+		BatchSize:    1000,
+		Workers:      1,
+		CodeSize:     128,
+		TrieMode:     TrieModeBinary,
+	}
+
+	// Run 1: all in-memory (CommitInterval=0, default behavior).
+	inMemDir := t.TempDir()
+	inMemConfig := baseConfig
+	inMemConfig.DBPath = filepath.Join(inMemDir, "db")
+	inMemConfig.CommitInterval = 0
+
+	gen1, err := New(inMemConfig)
+	if err != nil {
+		t.Fatalf("Failed to create in-memory generator: %v", err)
+	}
+	stats1, err := gen1.Generate()
+	if err != nil {
+		t.Fatalf("In-memory generation failed: %v", err)
+	}
+	gen1.Close()
+
+	// Run 2: incremental commits every 5 accounts.
+	commitDir := t.TempDir()
+	commitConfig := baseConfig
+	commitConfig.DBPath = filepath.Join(commitDir, "db")
+	commitConfig.CommitInterval = 5
+
+	gen2, err := New(commitConfig)
+	if err != nil {
+		t.Fatalf("Failed to create commit-interval generator: %v", err)
+	}
+	stats2, err := gen2.Generate()
+	if err != nil {
+		t.Fatalf("Commit-interval generation failed: %v", err)
+	}
+	gen2.Close()
+
+	// The state roots MUST be identical.
+	if stats1.StateRoot != stats2.StateRoot {
+		t.Errorf("State root mismatch between in-memory and commit-interval:\n  in-memory:       %s\n  commit-interval: %s",
+			stats1.StateRoot.Hex(), stats2.StateRoot.Hex())
+	}
+
+	// Also verify the same number of accounts, contracts, and slots.
+	if stats1.AccountsCreated != stats2.AccountsCreated {
+		t.Errorf("AccountsCreated mismatch: %d vs %d", stats1.AccountsCreated, stats2.AccountsCreated)
+	}
+	if stats1.ContractsCreated != stats2.ContractsCreated {
+		t.Errorf("ContractsCreated mismatch: %d vs %d", stats1.ContractsCreated, stats2.ContractsCreated)
+	}
+	if stats1.StorageSlotsCreated != stats2.StorageSlotsCreated {
+		t.Errorf("StorageSlotsCreated mismatch: %d vs %d", stats1.StorageSlotsCreated, stats2.StorageSlotsCreated)
+	}
+
+	t.Logf("Root equivalence confirmed: %s (in-memory) == %s (commit-interval=5)",
+		stats1.StateRoot.Hex(), stats2.StateRoot.Hex())
+	t.Logf("Stats: %d accounts, %d contracts, %d storage slots",
+		stats1.AccountsCreated, stats1.ContractsCreated, stats1.StorageSlotsCreated)
+}
+
+// TestBinaryTrieCommitIntervalGoldenHash verifies that the golden hash test
+// passes identically with CommitInterval>0. This ensures the incremental
+// commit path produces the exact same pinned hash as CommitInterval=0.
+func TestBinaryTrieCommitIntervalGoldenHash(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "testdb")
+
+	config := Config{
+		DBPath:         dbPath,
+		NumAccounts:    10,
+		NumContracts:   5,
+		MaxSlots:       100,
+		MinSlots:       1,
+		Distribution:   PowerLaw,
+		Seed:           12345,
+		BatchSize:      1000,
+		Workers:        1,
+		CodeSize:       256,
+		TrieMode:       TrieModeBinary,
+		CommitInterval: 3, // Commit every 3 accounts
+	}
+
+	gen, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create generator: %v", err)
+	}
+	defer gen.Close()
+
+	stats, err := gen.Generate()
+	if err != nil {
+		t.Fatalf("Failed to generate state: %v", err)
+	}
+
+	// Must match the same golden hash as TestBinaryTrieStateRootValue.
+	expected := common.HexToHash("0x67a3c9d83262434a5bd54fce34928cc72a8fe4668a447b199a3c860904b5c52a")
+	if stats.StateRoot != expected {
+		t.Errorf("CommitInterval golden hash mismatch:\n  got:  %s\n  want: %s",
+			stats.StateRoot.Hex(), expected.Hex())
+	}
+}
+
 func BenchmarkStorageValueEncoding(b *testing.B) {
 	value := common.HexToHash("0x000000000000000000000000000000000000000000000000000000000000abcd")
 	b.ResetTimer()
