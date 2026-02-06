@@ -12,12 +12,16 @@
 # Environment variables:
 #   PREGENERATED_STATE_PATH - Path to pre-generated chaindata (optional)
 #   GENESIS_PATH - Path to genesis.json (required for devnets without pre-init)
+#   BINARY_TRIE - Set to "true" to enable binary trie mode.
+#     Passes --override.verkle=0 to geth (legacy flag name for EIP-7864 binary trie).
 
 set -e
 
 GETH_DATADIR="${GETH_DATADIR:-/data/geth/execution-data}"
 PREGENERATED_STATE_PATH="${PREGENERATED_STATE_PATH:-/pregenerated-state/chaindata}"
 GENESIS_PATH="${GENESIS_PATH:-/genesis/genesis.json}"
+BINARY_TRIE="${BINARY_TRIE:-false}"
+SKIP_INIT=false
 
 log() {
     echo "[geth-wrapper] $1"
@@ -70,6 +74,13 @@ else
     log "Skipping geth init (database already initialized)"
 fi
 
+# Build extra args for binary trie mode
+EXTRA_ARGS=()
+if [[ "$BINARY_TRIE" == "true" ]]; then
+    EXTRA_ARGS+=("--override.verkle=0")
+    log "Binary trie mode enabled (--override.verkle=0)"
+fi
+
 # Execute the original geth command
-log "Starting geth: $@"
-exec geth "$@"
+log "Starting geth: $@ ${EXTRA_ARGS[*]}"
+exec geth "$@" "${EXTRA_ARGS[@]}"

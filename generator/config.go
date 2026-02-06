@@ -8,6 +8,18 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
+// TrieMode represents the trie algorithm used for state root computation.
+type TrieMode string
+
+const (
+	// TrieModeMPT uses the Merkle Patricia Trie (hexary, keccak256-based).
+	TrieModeMPT TrieMode = "mpt"
+
+	// TrieModeBinary uses the EIP-7864 binary trie.
+	// Compatible with geth's --override.verkle=0 flag (=0 is the activation block number).
+	TrieModeBinary TrieMode = "binary"
+)
+
 // Distribution represents the storage slot distribution strategy.
 type Distribution int
 
@@ -70,6 +82,10 @@ type Config struct {
 
 	// Verbose enables verbose logging.
 	Verbose bool
+
+	// TrieMode selects the trie algorithm for state root computation.
+	// Defaults to TrieModeMPT if empty.
+	TrieMode TrieMode
 
 	// GenesisAccounts are pre-defined accounts from genesis.json alloc.
 	// These are included in state generation with their exact addresses.

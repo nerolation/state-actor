@@ -16,6 +16,7 @@
 #   --geth-nodes N      Number of geth nodes (default: 2)
 #   --lighthouse-nodes N Number of lighthouse nodes (default: 2)
 #   --output-dir DIR    Output directory for generated data (default: ./devnet-data)
+#   --binary-trie       Generate state for binary trie mode (EIP-7864)
 #   --skip-generation   Skip state generation (use existing state)
 #   --help              Show this help
 
@@ -32,6 +33,7 @@ STATE_URL=""
 GETH_NODES=2
 LIGHTHOUSE_NODES=2
 OUTPUT_DIR="./devnet-data"
+BINARY_TRIE=false
 SKIP_GENERATION=false
 ETHEREUM_PACKAGE_PATH="${ETHEREUM_PACKAGE_PATH:-$HOME/tools/ethereum-package}"
 
@@ -63,6 +65,7 @@ while [[ $# -gt 0 ]]; do
         --geth-nodes) GETH_NODES="$2"; shift 2 ;;
         --lighthouse-nodes) LIGHTHOUSE_NODES="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --binary-trie) BINARY_TRIE=true; shift ;;
         --skip-generation) SKIP_GENERATION=true; shift ;;
         --help) usage ;;
         *) log_error "Unknown option: $1"; usage ;;
@@ -108,7 +111,10 @@ prepare_state() {
         
         local seed_arg=""
         [[ -n "$SEED" ]] && seed_arg="--seed $SEED"
-        
+
+        local binary_trie_arg=""
+        [[ "$BINARY_TRIE" == "true" ]] && binary_trie_arg="--binary-trie"
+
         # Run stategen in Docker
         docker run --rm \
             -v "$OUTPUT_DIR:/output" \
@@ -120,6 +126,7 @@ prepare_state() {
             --min-slots "$MIN_SLOTS" \
             --distribution "$DISTRIBUTION" \
             $seed_arg \
+            $binary_trie_arg \
             --verbose
     fi
     
@@ -144,7 +151,8 @@ cat << GETH
     count: 1
     el_extra_params:
       - "--cache=4096"
-      - "--txlookuplimit=0"
+      - "--txlookuplimit=0"$(if [[ "$BINARY_TRIE" == "true" ]]; then echo '
+      - "--override.verkle=0"'; fi)
     el_volume_size: 100000  # 100GB
 GETH
 done)

@@ -108,8 +108,19 @@ state-actor \
 | `--batch-size` | 10000 | DB batch size |
 | `--workers` | NumCPU | Parallel workers |
 | `--code-size` | 1024 | Average contract code size |
+| `--binary-trie` | false | Generate state for EIP-7864 binary trie mode |
 | `--verbose` | false | Verbose output |
 | `--benchmark` | false | Print detailed stats |
+
+### Trie Modes
+
+By default, State Actor uses the **Merkle Patricia Trie (MPT)** for state root computation, matching standard Ethereum. To generate state for **binary trie mode** (EIP-7864), pass `--binary-trie`:
+
+```bash
+state-actor --db ./chaindata --genesis genesis.json --accounts 10000 --contracts 5000 --binary-trie
+```
+
+Binary trie state requires geth to run with `--override.verkle=0` (legacy flag name for EIP-7864).
 
 ### Recommended Configurations
 
@@ -240,7 +251,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture docum
 ┌─────────────────────────────────────────┐
 │              Generator                  │
 │  • Genesis accounts + Generated state   │
-│  • StackTrie for state root             │
+│  • StackTrie (MPT) or BinaryTrie root   │
 │  • Parallel batch writers               │
 └────────────────────┬────────────────────┘
                      ▼
