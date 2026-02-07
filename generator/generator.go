@@ -310,18 +310,29 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		logProgress("EOA", i+1, g.config.NumAccounts, 0)
 	}
 
-	// Phase 3: Stream contract generation.
+	// Phase 3: Pipeline contract generation.
+	// A producer goroutine generates contracts (owns the RNG) while the
+	// consumer processes trie updates, overlapping CPU-heavy data generation
+	// with trie SHA-256 operations.
 	slotDistribution := g.generateSlotDistribution()
 
-	for i := 0; i < g.config.NumContracts; i++ {
-		numSlots := slotDistribution[i]
-		contract := g.generateContract(numSlots)
-		for genesisAddrs[contract.address] {
-			contract = g.generateContract(numSlots)
+	contractCh := make(chan *accountData, 16)
+	go func() {
+		defer close(contractCh)
+		for i := 0; i < g.config.NumContracts; i++ {
+			numSlots := slotDistribution[i]
+			contract := g.generateContract(numSlots)
+			for genesisAddrs[contract.address] {
+				contract = g.generateContract(numSlots)
+			}
+			contractCh <- contract
 		}
+	}()
 
+	contractIdx := 0
+	for contract := range contractCh {
 		if err := g.processAccountBinaryTrie(bt, bw, contract); err != nil {
-			return nil, fmt.Errorf("failed to process contract %d: %w", i, err)
+			return nil, fmt.Errorf("failed to process contract %d: %w", contractIdx, err)
 		}
 		// Count: 1 account + N storage slots + 1 code
 		insertions := 1 + len(contract.storage) + 1
@@ -330,7 +341,8 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		}
 		stats.ContractsCreated++
 		stats.StorageSlotsCreated += len(contract.storage)
-		logProgress("Contract", i+1, g.config.NumContracts, int64(stats.StorageSlotsCreated))
+		contractIdx++
+		logProgress("Contract", contractIdx, g.config.NumContracts, int64(stats.StorageSlotsCreated))
 	}
 
 	if err := bw.finish(); err != nil {
