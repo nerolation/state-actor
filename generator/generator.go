@@ -8,7 +8,6 @@ import (
 	"math"
 	mrand "math/rand"
 	"os"
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -135,7 +134,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create temp dir for trie backing store: %w", err)
 		}
-		pdb, err := pebble.New(tmpDir, 256, 128, "triedb/", false)
+		pdb, err := pebble.New(tmpDir, 512, 256, "triedb/", false)
 		if err != nil {
 			os.RemoveAll(tmpDir)
 			return nil, fmt.Errorf("failed to open trie backing store: %w", err)
@@ -146,7 +145,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 			os.RemoveAll(tmpDir)
 		}
 		if g.config.Verbose {
-			log.Printf("Using disk-backed trie (commit every %d accounts, tmpdir: %s)",
+			log.Printf("Using disk-backed trie (commit every %d trie insertions, tmpdir: %s)",
 				g.config.CommitInterval, tmpDir)
 		}
 	} else {
@@ -155,17 +154,16 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	}
 	defer cleanup()
 
-	trieDB := triedb.NewDatabase(backingDB, &triedb.Config{
-		IsVerkle: true,
-		PathDB:   pathdb.Defaults,
-	})
+	// Create initial trieDB. This will be recreated after each commit to release
+	// all memory including PrevalueTracer caches.
+	activeTrieDB := newTrieDB(backingDB)
 	defer func() {
-		if err := trieDB.Close(); err != nil && retErr == nil {
+		if err := activeTrieDB.Close(); err != nil && retErr == nil {
 			retErr = fmt.Errorf("failed to close trie database: %w", err)
 		}
 	}()
 
-	bt, err := bintrie.NewBinaryTrie(types.EmptyBinaryHash, trieDB)
+	bt, err := bintrie.NewBinaryTrie(types.EmptyBinaryHash, activeTrieDB)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create binary trie: %w", err)
 	}
@@ -177,49 +175,72 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	// recently-inserted paths are in memory; everything else is on disk
 	// as HashedNode references that resolve lazily on the next insert.
 	var (
-		totalProcessed int
-		lastRoot       = types.EmptyBinaryHash
-		blockNum       uint64
+		totalInsertions int // Counts trie insertions (accounts + storage slots + code entries)
+		lastRoot        = types.EmptyBinaryHash
+		blockNum        uint64
+		commitCount     int
+		lastLogTime     = time.Now()
 	)
 
-	maybeCommit := func() error {
+	// maybeCommit commits the trie to disk when insertions threshold is reached.
+	// The insertions parameter is the number of trie insertions just performed
+	// (1 for account, +N for storage slots, +1 for code if present).
+	// After commit, we close and recreate the trieDB to release all memory
+	// including the PrevalueTracer cache which can grow very large.
+	maybeCommit := func(insertions int) error {
 		if g.config.CommitInterval <= 0 {
 			return nil
 		}
-		totalProcessed++
-		if totalProcessed%g.config.CommitInterval != 0 {
+		totalInsertions += insertions
+		if totalInsertions < g.config.CommitInterval {
 			return nil
 		}
 
 		hash, nodeset := bt.Commit(false)
 		merged := trienode.NewWithNodeSet(nodeset)
-		if err := trieDB.Update(hash, lastRoot, blockNum, merged, triedb.NewStateSet()); err != nil {
-			return fmt.Errorf("trie db update at %d accounts: %w", totalProcessed, err)
+		if err := activeTrieDB.Update(hash, lastRoot, blockNum, merged, triedb.NewStateSet()); err != nil {
+			return fmt.Errorf("trie db update at %d insertions: %w", totalInsertions, err)
 		}
-		if err := trieDB.Commit(hash, false); err != nil {
-			return fmt.Errorf("trie db commit at %d accounts: %w", totalProcessed, err)
+		if err := activeTrieDB.Commit(hash, false); err != nil {
+			return fmt.Errorf("trie db commit at %d insertions: %w", totalInsertions, err)
 		}
 
-		// Reopen the trie from the committed root. The new trie's children
-		// are all HashedNode references — only the root InternalNode is loaded.
-		newBT, err := bintrie.NewBinaryTrie(hash, trieDB)
+		// Close old trieDB to release all caches and tracer references.
+		// This is critical: PrevalueTracer can accumulate GBs of resolved node blobs.
+		if err := activeTrieDB.Close(); err != nil {
+			return fmt.Errorf("failed to close trieDB after commit: %w", err)
+		}
+
+		// Create fresh trieDB with empty caches
+		activeTrieDB = newTrieDB(backingDB)
+
+		// Reopen the trie from the committed root with a fresh tracer.
+		newBT, err := bintrie.NewBinaryTrie(hash, activeTrieDB)
 		if err != nil {
 			return fmt.Errorf("reopen binary trie after commit: %w", err)
 		}
 		bt = newBT
 		lastRoot = hash
 		blockNum++
+		commitCount++
 
-		// Let GC reclaim the old trie's in-memory nodes.
-		runtime.GC()
+		log.Printf("Commit #%d: %d insertions (root: %s)",
+			commitCount, totalInsertions, hash.Hex()[:18])
 
-		if g.config.Verbose {
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			log.Printf("Committed trie at %d accounts (root: %s, heap: %s)",
-				totalProcessed, hash.Hex(), formatBytesUint64(m.HeapInuse))
-		}
+		// Reset counter after commit
+		totalInsertions = 0
 		return nil
+	}
+
+	// logProgress logs progress every 20 seconds (always, not just in verbose mode).
+	logProgress := func(phase string, current, total int, slots int64) {
+		if time.Since(lastLogTime) < 20*time.Second {
+			return
+		}
+		lastLogTime = time.Now()
+		pct := float64(current) / float64(total) * 100
+		log.Printf("[%s] %d/%d (%.1f%%), %d storage slots",
+			phase, current, total, pct, slots)
 	}
 
 	// Track genesis addresses for collision avoidance.
@@ -249,7 +270,12 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		if err := g.processAccountBinaryTrie(bt, bw, ad); err != nil {
 			return nil, fmt.Errorf("failed to process genesis account %s: %w", addr.Hex(), err)
 		}
-		if err := maybeCommit(); err != nil {
+		// Count: 1 account + N storage slots + 1 code (if present)
+		insertions := 1 + len(ad.storage)
+		if len(ad.code) > 0 {
+			insertions++
+		}
+		if err := maybeCommit(insertions); err != nil {
 			return nil, err
 		}
 
@@ -277,14 +303,11 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		if err := g.processAccountBinaryTrie(bt, bw, acc); err != nil {
 			return nil, fmt.Errorf("failed to process EOA %d: %w", i, err)
 		}
-		if err := maybeCommit(); err != nil {
+		if err := maybeCommit(1); err != nil { // EOA = 1 account insertion
 			return nil, err
 		}
 		stats.AccountsCreated++
-
-		if g.config.Verbose && (i+1)%1_000_000 == 0 {
-			log.Printf("Streamed %d / %d EOAs", i+1, g.config.NumAccounts)
-		}
+		logProgress("EOA", i+1, g.config.NumAccounts, 0)
 	}
 
 	// Phase 3: Stream contract generation.
@@ -300,16 +323,14 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		if err := g.processAccountBinaryTrie(bt, bw, contract); err != nil {
 			return nil, fmt.Errorf("failed to process contract %d: %w", i, err)
 		}
-		if err := maybeCommit(); err != nil {
+		// Count: 1 account + N storage slots + 1 code
+		insertions := 1 + len(contract.storage) + 1
+		if err := maybeCommit(insertions); err != nil {
 			return nil, err
 		}
 		stats.ContractsCreated++
 		stats.StorageSlotsCreated += len(contract.storage)
-
-		if g.config.Verbose && (i+1)%100_000 == 0 {
-			log.Printf("Streamed %d / %d contracts (%d total slots so far)",
-				i+1, g.config.NumContracts, stats.StorageSlotsCreated)
-		}
+		logProgress("Contract", i+1, g.config.NumContracts, int64(stats.StorageSlotsCreated))
 	}
 
 	if err := bw.finish(); err != nil {
@@ -342,18 +363,19 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	return stats, nil
 }
 
-// formatBytesUint64 formats a byte count for log output.
-func formatBytesUint64(b uint64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := uint64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+// newTrieDB creates a fresh trieDB with config sized for inter-commit working set.
+// Since trieDB is recreated after each commit, caches don't need to be large.
+// This ensures all memory (including PrevalueTracer) is released between commits.
+func newTrieDB(backingDB ethdb.Database) *triedb.Database {
+	return triedb.NewDatabase(backingDB, &triedb.Config{
+		IsVerkle: true,
+		PathDB: &pathdb.Config{
+			TrieCleanSize:   256 * 1024 * 1024, // 256MB - small, discarded after commit
+			StateCleanSize:  32 * 1024 * 1024,  // 32MB
+			WriteBufferSize: 64 * 1024 * 1024,  // 64MB
+			NoAsyncFlush:    true,              // Releases frozen buffer after flush
+		},
+	})
 }
 
 // processAccountBinaryTrie inserts a single account into the binary trie and
