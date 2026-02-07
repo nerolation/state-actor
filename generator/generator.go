@@ -258,9 +258,9 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 			addrHash: addrHash,
 			account:  acc,
 		}
-		if storage, ok := g.config.GenesisStorage[addr]; ok {
-			ad.storage = storage
-			stats.StorageSlotsCreated += len(storage)
+		if storageMap, ok := g.config.GenesisStorage[addr]; ok {
+			ad.storage = mapToSortedSlots(storageMap)
+			stats.StorageSlotsCreated += len(ad.storage)
 		}
 		if code, ok := g.config.GenesisCode[addr]; ok {
 			ad.code = code
@@ -392,23 +392,20 @@ func (g *Generator) processAccountBinaryTrie(bt *bintrie.BinaryTrie, bw *batchWr
 		}
 	}
 
-	// Process storage: sort keys for deterministic insertion, update trie and snapshot.
-	// Skip entirely for EOAs (no allocation, no sort overhead).
-	var storageKeys []common.Hash
-	if len(acc.storage) > 0 {
-		storageKeys = make([]common.Hash, 0, len(acc.storage))
-		for k := range acc.storage {
-			storageKeys = append(storageKeys, k)
+	// Process storage: update trie and write snapshot in a single pass.
+	// Storage is pre-sorted by Key for deterministic trie insertion.
+	for _, slot := range acc.storage {
+		if err := bt.UpdateStorage(acc.address, slot.Key[:], slot.Value[:]); err != nil {
+			return fmt.Errorf("binary trie UpdateStorage: %w", err)
 		}
-		sort.Slice(storageKeys, func(i, j int) bool {
-			return bytes.Compare(storageKeys[i][:], storageKeys[j][:]) < 0
-		})
-
-		for _, slotKey := range storageKeys {
-			slotValue := acc.storage[slotKey]
-			if err := bt.UpdateStorage(acc.address, slotKey[:], slotValue[:]); err != nil {
-				return fmt.Errorf("binary trie UpdateStorage: %w", err)
-			}
+		keyHash := crypto.Keccak256Hash(slot.Key[:])
+		valueRLP, err := encodeStorageValue(slot.Value)
+		if err != nil {
+			return fmt.Errorf("encode storage value: %w", err)
+		}
+		storageKey := storageSnapshotKey(acc.addrHash, keyHash)
+		if err := bw.put(storageKey, valueRLP, &bw.storageBytes); err != nil {
+			return fmt.Errorf("snapshot storage write: %w", err)
 		}
 	}
 
@@ -422,20 +419,6 @@ func (g *Generator) processAccountBinaryTrie(bt *bintrie.BinaryTrie, bw *batchWr
 		return fmt.Errorf("snapshot account write: %w", err)
 	}
 
-	// Storage snapshots (keccak256-keyed).
-	for _, slotKey := range storageKeys {
-		slotValue := acc.storage[slotKey]
-		keyHash := crypto.Keccak256Hash(slotKey[:])
-		valueRLP, err := encodeStorageValue(slotValue)
-		if err != nil {
-			return fmt.Errorf("encode storage value: %w", err)
-		}
-		storageKey := storageSnapshotKey(acc.addrHash, keyHash)
-		if err := bw.put(storageKey, valueRLP, &bw.storageBytes); err != nil {
-			return fmt.Errorf("snapshot storage write: %w", err)
-		}
-	}
-
 	// Code snapshot (same format as MPT).
 	if len(acc.code) > 0 {
 		cKey := codeKey(acc.codeHash)
@@ -447,6 +430,12 @@ func (g *Generator) processAccountBinaryTrie(bt *bintrie.BinaryTrie, bw *batchWr
 	return nil
 }
 
+// storageSlot is a key-value pair for deterministic storage iteration.
+type storageSlot struct {
+	Key   common.Hash
+	Value common.Hash
+}
+
 // accountData holds generated account data.
 type accountData struct {
 	address   common.Address
@@ -454,7 +443,19 @@ type accountData struct {
 	account   *types.StateAccount
 	code      []byte
 	codeHash  common.Hash
-	storage   map[common.Hash]common.Hash
+	storage   []storageSlot // pre-sorted by Key for deterministic trie insertion
+}
+
+// mapToSortedSlots converts a storage map to a sorted slice of storageSlot.
+func mapToSortedSlots(m map[common.Hash]common.Hash) []storageSlot {
+	slots := make([]storageSlot, 0, len(m))
+	for k, v := range m {
+		slots = append(slots, storageSlot{Key: k, Value: v})
+	}
+	sort.Slice(slots, func(i, j int) bool {
+		return bytes.Compare(slots[i].Key[:], slots[j].Key[:]) < 0
+	})
+	return slots
 }
 
 // generateAccounts generates account and contract data.
@@ -479,9 +480,9 @@ func (g *Generator) generateAccounts(stats *Stats) ([]*accountData, []*accountDa
 		}
 
 		// Include genesis storage if present
-		if storage, ok := g.config.GenesisStorage[addr]; ok {
-			ad.storage = storage
-			stats.StorageSlotsCreated += len(storage)
+		if storageMap, ok := g.config.GenesisStorage[addr]; ok {
+			ad.storage = mapToSortedSlots(storageMap)
+			stats.StorageSlotsCreated += len(ad.storage)
 		}
 
 		// Include genesis code if present
@@ -583,8 +584,8 @@ func (g *Generator) generateContract(numSlots int) *accountData {
 		uint256.NewInt(1e18),
 	)
 
-	// Generate storage slots
-	storage := make(map[common.Hash]common.Hash, numSlots)
+	// Generate storage slots as a pre-sorted slice for deterministic trie insertion.
+	storage := make([]storageSlot, 0, numSlots)
 	for j := 0; j < numSlots; j++ {
 		var key, value common.Hash
 		g.rng.Read(key[:])
@@ -593,8 +594,11 @@ func (g *Generator) generateContract(numSlots int) *accountData {
 		if value == (common.Hash{}) {
 			value[31] = 1
 		}
-		storage[key] = value
+		storage = append(storage, storageSlot{Key: key, Value: value})
 	}
+	sort.Slice(storage, func(i, j int) bool {
+		return bytes.Compare(storage[i].Key[:], storage[j].Key[:]) < 0
+	})
 
 	return &accountData{
 		address:  addr,
@@ -781,30 +785,28 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 
 	// Process all accounts (EOAs and contracts) in sorted order
 	for _, acc := range allAccounts {
-		// Process storage for contracts
+		// Process storage for contracts.
+		// MPT requires keys sorted by Keccak256(key), not raw key.
 		if len(acc.storage) > 0 {
 			storageTrie := trie.NewStackTrie(nil)
 
-			// Collect storage keys with their hashes
 			type keyWithHash struct {
-				key     common.Hash
+				slot    storageSlot
 				keyHash common.Hash
 			}
-			storageKeys := make([]keyWithHash, 0, len(acc.storage))
-			for key := range acc.storage {
-				storageKeys = append(storageKeys, keyWithHash{
-					key:     key,
-					keyHash: crypto.Keccak256Hash(key[:]),
-				})
+			withHashes := make([]keyWithHash, len(acc.storage))
+			for i, slot := range acc.storage {
+				withHashes[i] = keyWithHash{
+					slot:    slot,
+					keyHash: crypto.Keccak256Hash(slot.Key[:]),
+				}
 			}
-			// Sort by keyHash (StackTrie requires sorted keys)
-			sort.Slice(storageKeys, func(i, j int) bool {
-				return bytes.Compare(storageKeys[i].keyHash[:], storageKeys[j].keyHash[:]) < 0
+			sort.Slice(withHashes, func(i, j int) bool {
+				return bytes.Compare(withHashes[i].keyHash[:], withHashes[j].keyHash[:]) < 0
 			})
 
-			for _, kh := range storageKeys {
-				value := acc.storage[kh.key]
-				valueRLP, err := encodeStorageValue(value)
+			for _, kh := range withHashes {
+				valueRLP, err := encodeStorageValue(kh.slot.Value)
 				if err != nil {
 					return err
 				}
@@ -817,7 +819,6 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 				storageTrie.Update(kh.keyHash[:], valueRLP)
 			}
 
-			// Update account's storage root
 			acc.account.Root = storageTrie.Hash()
 		}
 
