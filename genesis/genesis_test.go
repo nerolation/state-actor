@@ -184,7 +184,7 @@ func TestWriteGenesisBlock(t *testing.T) {
 	// Use a deterministic state root for testing
 	stateRoot := common.HexToHash("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
 
-	block, err := WriteGenesisBlock(db, genesis, stateRoot, false)
+	block, err := WriteGenesisBlock(db, genesis, stateRoot, false, "")
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestWriteGenesisBlockWithShanghai(t *testing.T) {
 	genesis.Config.ShanghaiTime = &zero
 
 	stateRoot := common.HexToHash("0xabcd")
-	block, err := WriteGenesisBlock(db, genesis, stateRoot, false)
+	block, err := WriteGenesisBlock(db, genesis, stateRoot, false, "")
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestWriteGenesisBlockWithCancun(t *testing.T) {
 	genesis.Config.CancunTime = &zero
 
 	stateRoot := common.HexToHash("0xabcd")
-	block, err := WriteGenesisBlock(db, genesis, stateRoot, false)
+	block, err := WriteGenesisBlock(db, genesis, stateRoot, false, "")
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestWriteGenesisBlockBinaryTrie(t *testing.T) {
 	genesis := sampleGenesis()
 	stateRoot := common.HexToHash("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
 
-	block, err := WriteGenesisBlock(db, genesis, stateRoot, true)
+	block, err := WriteGenesisBlock(db, genesis, stateRoot, true, "")
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestWriteGenesisBlockBinaryTrieNoMutation(t *testing.T) {
 
 	stateRoot := common.HexToHash("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
 
-	_, err := WriteGenesisBlock(db, gen, stateRoot, true)
+	_, err := WriteGenesisBlock(db, gen, stateRoot, true, "")
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}

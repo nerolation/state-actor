@@ -103,6 +103,22 @@ type Config struct {
 	// committed to a temporary Pebble database and reopened, bounding memory
 	// to the working set between commits (~1-2 GB) instead of the full trie.
 	CommitInterval int
+
+	// WriteTrieNodes enables writing serialized binary trie nodes to the
+	// database during Phase 2 hash computation, making the database usable
+	// by geth's PathDB. Automatically set when --genesis is provided.
+	WriteTrieNodes bool
+
+	// InjectAddresses is a list of additional addresses to inject into the
+	// generated state with a large balance (999999999 ETH). This is useful
+	// for pre-funding test accounts (e.g. Anvil's default account).
+	InjectAddresses []common.Address
+
+	// TargetSize is the target total database size on disk in bytes.
+	// When set (> 0), the generator stops creating contracts once the
+	// estimated on-disk size reaches this target. NumAccounts and
+	// NumContracts serve as upper bounds. 0 means no size limit.
+	TargetSize uint64
 }
 
 // Stats holds statistics about the generation process.
@@ -130,6 +146,12 @@ type Stats struct {
 
 	// StateRoot is the computed state root hash.
 	StateRoot common.Hash
+
+	// SampleEOAs holds a few sample EOA addresses for post-generation verification.
+	SampleEOAs []common.Address
+
+	// SampleContracts holds a few sample contract addresses for post-generation verification.
+	SampleContracts []common.Address
 
 	// DBWriteTime is the time spent writing to the database.
 	DBWriteTime time.Duration

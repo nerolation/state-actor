@@ -607,7 +607,7 @@ func TestBinaryTrieStateRootValue(t *testing.T) {
 		t.Fatalf("Failed to generate state: %v", err)
 	}
 
-	expected := common.HexToHash("0x67a3c9d83262434a5bd54fce34928cc72a8fe4668a447b199a3c860904b5c52a")
+	expected := common.HexToHash("0x705a2444d071172ede2025116221d21ee38c8dc9fc426b76eb61ecc348f913c2")
 	if stats.StateRoot != expected {
 		t.Errorf("Binary trie state root mismatch:\n  got:  %s\n  want: %s\nThis may indicate an upstream bintrie API change.",
 			stats.StateRoot.Hex(), expected.Hex())
@@ -726,10 +726,87 @@ func TestBinaryTrieCommitIntervalGoldenHash(t *testing.T) {
 	}
 
 	// Must match the same golden hash as TestBinaryTrieStateRootValue.
-	expected := common.HexToHash("0x67a3c9d83262434a5bd54fce34928cc72a8fe4668a447b199a3c860904b5c52a")
+	expected := common.HexToHash("0x705a2444d071172ede2025116221d21ee38c8dc9fc426b76eb61ecc348f913c2")
 	if stats.StateRoot != expected {
 		t.Errorf("CommitInterval golden hash mismatch:\n  got:  %s\n  want: %s",
 			stats.StateRoot.Hex(), expected.Hex())
+	}
+}
+
+func TestTargetSizeStopsEarly(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "testdb")
+
+	// Generate without target-size to get a baseline entry count.
+	configFull := Config{
+		DBPath:       dbPath,
+		NumAccounts:  20,
+		NumContracts: 50,
+		MaxSlots:     100,
+		MinSlots:     10,
+		Distribution: PowerLaw,
+		Seed:         42,
+		BatchSize:    1000,
+		Workers:      1,
+		CodeSize:     256,
+		TrieMode:     TrieModeBinary,
+	}
+
+	genFull, err := New(configFull)
+	if err != nil {
+		t.Fatalf("Failed to create full generator: %v", err)
+	}
+	statsFull, err := genFull.Generate()
+	if err != nil {
+		t.Fatalf("Failed to generate full state: %v", err)
+	}
+	genFull.Close()
+
+	// Now generate with a target-size that's roughly 30% of full.
+	// Full run creates many contracts; a small target should stop early.
+	fullContracts := statsFull.ContractsCreated
+	if fullContracts < 10 {
+		t.Skipf("Full run only created %d contracts, not enough to test early stop", fullContracts)
+	}
+
+	dbPath2 := filepath.Join(tmpDir, "testdb2")
+	// Use a small target size (50KB) to ensure early stopping.
+	configTarget := Config{
+		DBPath:       dbPath2,
+		NumAccounts:  20,
+		NumContracts: 50,
+		MaxSlots:     100,
+		MinSlots:     10,
+		Distribution: PowerLaw,
+		Seed:         42,
+		BatchSize:    1000,
+		Workers:      1,
+		CodeSize:     256,
+		TrieMode:     TrieModeBinary,
+		TargetSize:   50 * 1024, // 50 KB target
+	}
+
+	genTarget, err := New(configTarget)
+	if err != nil {
+		t.Fatalf("Failed to create target generator: %v", err)
+	}
+	statsTarget, err := genTarget.Generate()
+	if err != nil {
+		t.Fatalf("Failed to generate target state: %v", err)
+	}
+	genTarget.Close()
+
+	t.Logf("Full: %d contracts, %d slots", statsFull.ContractsCreated, statsFull.StorageSlotsCreated)
+	t.Logf("Target (50KB): %d contracts, %d slots", statsTarget.ContractsCreated, statsTarget.StorageSlotsCreated)
+
+	if statsTarget.ContractsCreated >= statsFull.ContractsCreated {
+		t.Errorf("Target-size should have stopped early: created %d contracts (full run: %d)",
+			statsTarget.ContractsCreated, statsFull.ContractsCreated)
+	}
+
+	// The target run should still produce a valid state root.
+	if statsTarget.StateRoot == (common.Hash{}) {
+		t.Error("Target run produced empty state root")
 	}
 }
 

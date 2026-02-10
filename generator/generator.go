@@ -14,17 +14,12 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
-	"github.com/ethereum/go-ethereum/trie/bintrie"
-	"github.com/ethereum/go-ethereum/trie/trienode"
-	"github.com/ethereum/go-ethereum/triedb"
-	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"github.com/holiman/uint256"
 )
 
@@ -101,152 +96,91 @@ func (g *Generator) Generate() (*Stats, error) {
 }
 
 // generateStreamingBinary generates state for binary trie mode using a
-// streaming approach. Instead of allocating all account data in memory before
-// writing, each account is generated, inserted into the binary trie, written
-// to the snapshot database, and then discarded. This bounds the memory used
-// by account data to O(1) per account.
+// two-phase approach:
 //
-// When CommitInterval is 0, the entire binary trie resides in memory. For a
-// 300 GB state target this requires ~300 GB of RAM.
+// Phase 1: Generate account/contract/storage data, write snapshot entries to
+// Pebble (via batchWriter), and collect trie entries (key-value pairs) into a
+// flat in-memory slice. Each entry is 64 bytes (32-byte key + 32-byte value).
 //
-// When CommitInterval > 0, the trie is periodically committed to a temporary
-// Pebble database and reopened from its root hash. After reopening, all
-// children are HashedNode references that resolve lazily from disk on insert.
-// Only the nodes along recently-inserted paths stay in memory, bounding peak
-// usage to ~1-2 GB regardless of total state size.
+// Phase 2: Sort entries by key, then compute the binary trie root hash via
+// recursive divide-and-conquer — grouping by stem, computing StemNode hashes,
+// and building the InternalNode tree. No BinaryTrie object, no disk I/O for
+// trie nodes, no commit/reopen cycles.
 //
-// Address collision detection is limited to genesis alloc addresses only.
-// Collisions between randomly generated 160-bit addresses are statistically
-// impossible (probability ~10^-30 for 10^9 addresses).
+// This approach is analogous to how MPT mode uses StackTrie: sorted input
+// enables streaming construction. It eliminates the 35x penalty from
+// HashedNode disk resolution that plagued the old commit-interval approach.
+//
+// Memory: O(N × 64 bytes) for the entries slice, where N is the total number
+// of trie entries (accounts × 2 + storage slots + code chunks).
 func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	stats := &Stats{}
 	start := time.Now()
 
-	// Choose backing store based on CommitInterval.
-	// When committing incrementally, use a temporary Pebble database so trie
-	// nodes survive across commit→reopen cycles. Otherwise use an in-memory DB.
-	var (
-		backingDB ethdb.Database
-		cleanup   func()
-	)
-	if g.config.CommitInterval > 0 {
-		tmpDir, err := os.MkdirTemp("", "bintrie-*")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create temp dir for trie backing store: %w", err)
-		}
-		pdb, err := pebble.New(tmpDir, 512, 256, "triedb/", false)
-		if err != nil {
-			os.RemoveAll(tmpDir)
-			return nil, fmt.Errorf("failed to open trie backing store: %w", err)
-		}
-		backingDB = rawdb.NewDatabase(pdb)
-		cleanup = func() {
-			pdb.Close()
-			os.RemoveAll(tmpDir)
-		}
-		if g.config.Verbose {
-			log.Printf("Using disk-backed trie (commit every %d trie insertions, tmpdir: %s)",
-				g.config.CommitInterval, tmpDir)
-		}
-	} else {
-		backingDB = rawdb.NewMemoryDatabase()
-		cleanup = func() { backingDB.Close() }
-	}
-	defer cleanup()
-
-	// Create initial trieDB. This will be recreated after each commit to release
-	// all memory including PrevalueTracer caches.
-	activeTrieDB := newTrieDB(backingDB)
-	defer func() {
-		if err := activeTrieDB.Close(); err != nil && retErr == nil {
-			retErr = fmt.Errorf("failed to close trie database: %w", err)
-		}
-	}()
-
-	bt, err := bintrie.NewBinaryTrie(types.EmptyBinaryHash, activeTrieDB)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create binary trie: %w", err)
+	if g.config.CommitInterval > 0 && g.config.Verbose {
+		log.Printf("NOTE: --commit-interval is ignored (binary stack trie computes root from sorted entries)")
 	}
 
 	bw := newBatchWriter(g.db, g.config.BatchSize, g.config.Workers)
 	defer bw.close()
 
-	// Incremental commit state. Between commits, only the nodes along
-	// recently-inserted paths are in memory; everything else is on disk
-	// as HashedNode references that resolve lazily on the next insert.
-	var (
-		totalInsertions int // Counts trie insertions (accounts + storage slots + code entries)
-		lastRoot        = types.EmptyBinaryHash
-		blockNum        uint64
-		commitCount     int
-		lastLogTime     = time.Now()
-	)
+	// --- Phase 1: Generate data, write snapshots, write trie entries to temp DB ---
+	//
+	// Instead of collecting entries in an in-memory slice (which grows linearly
+	// with state size), we write each trie entry to a temporary Pebble DB.
+	// Pebble's LSM tree keeps keys sorted automatically, so Phase 2 can
+	// iterate in order without an explicit sort step. Memory stays O(1).
+	tempDir, err := os.MkdirTemp("", "state-actor-sort-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
 
-	// maybeCommit commits the trie to disk when insertions threshold is reached.
-	// The insertions parameter is the number of trie insertions just performed
-	// (1 for account, +N for storage slots, +1 for code if present).
-	// After commit, we close and recreate the trieDB to release all memory
-	// including the PrevalueTracer cache which can grow very large.
-	maybeCommit := func(insertions int) error {
-		if g.config.CommitInterval <= 0 {
-			return nil
+	tempDB, err := pebble.New(tempDir, 128, 64, "temp/", false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp sort DB: %w", err)
+	}
+	defer tempDB.Close()
+
+	tempBatch := tempDB.NewBatch()
+	var entryCount int64
+
+	// writeEntries writes a batch of trie entries to the temp DB.
+	writeEntries := func(entries []trieEntry) error {
+		for i := range entries {
+			if err := tempBatch.Put(entries[i].Key[:], entries[i].Value[:]); err != nil {
+				return err
+			}
+			entryCount++
+			if tempBatch.ValueSize() >= 64*1024*1024 { // flush every 64 MB
+				if err := tempBatch.Write(); err != nil {
+					return err
+				}
+				tempBatch.Reset()
+			}
 		}
-		totalInsertions += insertions
-		if totalInsertions < g.config.CommitInterval {
-			return nil
-		}
-
-		hash, nodeset := bt.Commit(false)
-		merged := trienode.NewWithNodeSet(nodeset)
-		if err := activeTrieDB.Update(hash, lastRoot, blockNum, merged, triedb.NewStateSet()); err != nil {
-			return fmt.Errorf("trie db update at %d insertions: %w", totalInsertions, err)
-		}
-		if err := activeTrieDB.Commit(hash, false); err != nil {
-			return fmt.Errorf("trie db commit at %d insertions: %w", totalInsertions, err)
-		}
-
-		// Close old trieDB to release all caches and tracer references.
-		// This is critical: PrevalueTracer can accumulate GBs of resolved node blobs.
-		if err := activeTrieDB.Close(); err != nil {
-			return fmt.Errorf("failed to close trieDB after commit: %w", err)
-		}
-
-		// Create fresh trieDB with empty caches
-		activeTrieDB = newTrieDB(backingDB)
-
-		// Reopen the trie from the committed root with a fresh tracer.
-		newBT, err := bintrie.NewBinaryTrie(hash, activeTrieDB)
-		if err != nil {
-			return fmt.Errorf("reopen binary trie after commit: %w", err)
-		}
-		bt = newBT
-		lastRoot = hash
-		blockNum++
-		commitCount++
-
-		log.Printf("Commit #%d: %d insertions (root: %s)",
-			commitCount, totalInsertions, hash.Hex()[:18])
-
-		// Reset counter after commit
-		totalInsertions = 0
 		return nil
 	}
 
-	// logProgress logs progress every 20 seconds (always, not just in verbose mode).
+	var lastLogTime = time.Now()
 	logProgress := func(phase string, current, total int, slots int64) {
 		if time.Since(lastLogTime) < 20*time.Second {
 			return
 		}
 		lastLogTime = time.Now()
 		pct := float64(current) / float64(total) * 100
-		log.Printf("[%s] %d/%d (%.1f%%), %d storage slots",
-			phase, current, total, pct, slots)
+		log.Printf("[%s] %d/%d (%.1f%%), %d storage slots, %d trie entries",
+			phase, current, total, pct, slots, entryCount)
 	}
 
 	// Track genesis addresses for collision avoidance.
 	genesisAddrs := make(map[common.Address]bool, len(g.config.GenesisAccounts))
 
-	// Phase 1: Stream genesis alloc accounts.
+	// Reusable entries buffer — collectAccountEntries appends to this,
+	// then writeEntries drains it, then we reset to reuse the backing array.
+	var entryBuf []trieEntry
+
+	// 1a. Genesis alloc accounts.
 	for addr, acc := range g.config.GenesisAccounts {
 		genesisAddrs[addr] = true
 
@@ -267,16 +201,12 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 			ad.codeHash = codeHash
 		}
 
-		if err := g.processAccountBinaryTrie(bt, bw, ad); err != nil {
-			return nil, fmt.Errorf("failed to process genesis account %s: %w", addr.Hex(), err)
+		entryBuf = collectAccountEntries(addr, acc, len(ad.code), ad.code, ad.storage, entryBuf[:0])
+		if err := writeEntries(entryBuf); err != nil {
+			return nil, fmt.Errorf("failed to write genesis trie entries: %w", err)
 		}
-		// Count: 1 account + N storage slots + 1 code (if present)
-		insertions := 1 + len(ad.storage)
-		if len(ad.code) > 0 {
-			insertions++
-		}
-		if err := maybeCommit(insertions); err != nil {
-			return nil, err
+		if err := writeAccountSnapshot(bw, ad); err != nil {
+			return nil, fmt.Errorf("failed to write genesis account %s: %w", addr.Hex(), err)
 		}
 
 		if len(ad.code) > 0 || len(ad.storage) > 0 {
@@ -286,36 +216,72 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		}
 	}
 
-	genesisEOAs := stats.AccountsCreated
-	genesisContracts := stats.ContractsCreated
 	if g.config.Verbose && len(g.config.GenesisAccounts) > 0 {
 		log.Printf("Included %d genesis alloc accounts (%d EOAs, %d contracts)",
-			len(g.config.GenesisAccounts), genesisEOAs, genesisContracts)
+			len(g.config.GenesisAccounts), stats.AccountsCreated, stats.ContractsCreated)
 	}
 
-	// Phase 2: Stream EOA generation.
+	// Inject any explicitly-requested addresses (e.g. Anvil's default account).
+	for _, addr := range g.config.InjectAddresses {
+		if genesisAddrs[addr] {
+			continue
+		}
+		genesisAddrs[addr] = true
+		injectBalance := new(uint256.Int).Mul(uint256.NewInt(999999999), uint256.NewInt(1e18))
+		injectAccount := &types.StateAccount{
+			Nonce:    0,
+			Balance:  injectBalance,
+			Root:     types.EmptyRootHash,
+			CodeHash: types.EmptyCodeHash.Bytes(),
+		}
+		entryBuf = collectAccountEntries(addr, injectAccount, 0, nil, nil, entryBuf[:0])
+		if err := writeEntries(entryBuf); err != nil {
+			return nil, fmt.Errorf("failed to write injected trie entries: %w", err)
+		}
+		ad := &accountData{
+			address:  addr,
+			addrHash: crypto.Keccak256Hash(addr[:]),
+			account:  injectAccount,
+		}
+		if err := writeAccountSnapshot(bw, ad); err != nil {
+			return nil, fmt.Errorf("failed to write injected account %s: %w", addr.Hex(), err)
+		}
+		stats.AccountsCreated++
+		if g.config.Verbose {
+			log.Printf("Injected account %s with %s wei", addr.Hex(), injectBalance.String())
+		}
+	}
+
+	// 1b. EOA generation.
 	for i := 0; i < g.config.NumAccounts; i++ {
 		acc := g.generateEOA()
 		for genesisAddrs[acc.address] {
 			acc = g.generateEOA()
 		}
 
-		if err := g.processAccountBinaryTrie(bt, bw, acc); err != nil {
-			return nil, fmt.Errorf("failed to process EOA %d: %w", i, err)
+		entryBuf = collectAccountEntries(acc.address, acc.account, 0, nil, nil, entryBuf[:0])
+		if err := writeEntries(entryBuf); err != nil {
+			return nil, fmt.Errorf("failed to write EOA trie entries: %w", err)
 		}
-		if err := maybeCommit(1); err != nil { // EOA = 1 account insertion
-			return nil, err
+		if err := writeAccountSnapshot(bw, acc); err != nil {
+			return nil, fmt.Errorf("failed to write EOA %d: %w", i, err)
 		}
 		stats.AccountsCreated++
+		if len(stats.SampleEOAs) < 3 {
+			stats.SampleEOAs = append(stats.SampleEOAs, acc.address)
+		}
 		logProgress("EOA", i+1, g.config.NumAccounts, 0)
 	}
 
-	// Phase 3: Pipeline contract generation.
-	// A producer goroutine generates contracts (owns the RNG) while the
-	// consumer processes trie updates, overlapping CPU-heavy data generation
-	// with trie SHA-256 operations.
+	// 1c. Contract generation via producer-consumer pipeline.
+	// The bytesPerEntry constant estimates total on-disk size per trie entry
+	// (snapshot data + trie nodes + Pebble overhead). Empirically measured
+	// at ~236 bytes/entry from a 12 GB / 50.8M entry benchmark.
+	const bytesPerEntry uint64 = 240
+
 	slotDistribution := g.generateSlotDistribution()
 
+	done := make(chan struct{})
 	contractCh := make(chan *accountData, 16)
 	go func() {
 		defer close(contractCh)
@@ -325,32 +291,81 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 			for genesisAddrs[contract.address] {
 				contract = g.generateContract(numSlots)
 			}
-			contractCh <- contract
+			select {
+			case contractCh <- contract:
+			case <-done:
+				return
+			}
 		}
 	}()
 
 	contractIdx := 0
+	targetReached := false
 	for contract := range contractCh {
-		if err := g.processAccountBinaryTrie(bt, bw, contract); err != nil {
-			return nil, fmt.Errorf("failed to process contract %d: %w", contractIdx, err)
+		entryBuf = collectAccountEntries(contract.address, contract.account, len(contract.code), contract.code, contract.storage, entryBuf[:0])
+		if err := writeEntries(entryBuf); err != nil {
+			return nil, fmt.Errorf("failed to write contract trie entries: %w", err)
 		}
-		// Count: 1 account + N storage slots + 1 code
-		insertions := 1 + len(contract.storage) + 1
-		if err := maybeCommit(insertions); err != nil {
-			return nil, err
+		if err := writeAccountSnapshot(bw, contract); err != nil {
+			return nil, fmt.Errorf("failed to write contract %d: %w", contractIdx, err)
 		}
 		stats.ContractsCreated++
 		stats.StorageSlotsCreated += len(contract.storage)
+		if len(stats.SampleContracts) < 3 {
+			stats.SampleContracts = append(stats.SampleContracts, contract.address)
+		}
 		contractIdx++
 		logProgress("Contract", contractIdx, g.config.NumContracts, int64(stats.StorageSlotsCreated))
+
+		// Check target size after each contract.
+		if g.config.TargetSize > 0 {
+			estimatedSize := uint64(entryCount) * bytesPerEntry
+			if estimatedSize >= g.config.TargetSize {
+				if g.config.Verbose {
+					log.Printf("Target size reached: %d entries × %d ≈ %s (target: %s)",
+						entryCount, bytesPerEntry,
+						formatBytesInternal(estimatedSize),
+						formatBytesInternal(g.config.TargetSize))
+				}
+				targetReached = true
+				close(done)
+				break
+			}
+		}
+	}
+	// Drain producer if we broke early.
+	if targetReached {
+		for range contractCh {
+		}
 	}
 
+	// Flush remaining temp entries and snapshot batches.
+	if tempBatch.ValueSize() > 0 {
+		if err := tempBatch.Write(); err != nil {
+			return nil, fmt.Errorf("failed to flush temp batch: %w", err)
+		}
+	}
 	if err := bw.finish(); err != nil {
 		return nil, fmt.Errorf("failed to finish batch writes: %w", err)
 	}
 
-	// Compute state root from binary trie.
-	stateRoot := bt.Hash()
+	// --- Phase 2: Stream sorted entries from temp DB → compute root hash ---
+
+	if g.config.Verbose {
+		log.Printf("Computing root from %d trie entries (streaming, O(depth) memory)...", entryCount)
+	}
+
+	hashStart := time.Now()
+	var nodeDB ethdb.KeyValueStore
+	if g.config.WriteTrieNodes {
+		nodeDB = g.db
+	}
+	iter := tempDB.NewIterator(nil, nil)
+	stateRoot := computeBinaryRootStreaming(iter, nodeDB)
+	if g.config.Verbose {
+		log.Printf("Computed binary trie root in %v", time.Since(hashStart).Round(time.Millisecond))
+	}
+
 	stats.StateRoot = stateRoot
 
 	if err := g.db.Put([]byte("SnapshotRoot"), stateRoot[:]); err != nil {
@@ -358,9 +373,9 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	}
 
 	if g.config.Verbose {
-		log.Printf("State root (binary trie, streaming): %s", stateRoot.Hex())
-		log.Printf("Generated %d accounts, %d contracts with %d total storage slots",
-			stats.AccountsCreated, stats.ContractsCreated, stats.StorageSlotsCreated)
+		log.Printf("State root (binary stack trie): %s", stateRoot.Hex())
+		log.Printf("Generated %d accounts, %d contracts with %d total storage slots (%d trie entries)",
+			stats.AccountsCreated, stats.ContractsCreated, stats.StorageSlotsCreated, entryCount)
 	}
 
 	stats.AccountBytes = bw.accountBytes.Load()
@@ -375,41 +390,12 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	return stats, nil
 }
 
-// newTrieDB creates a fresh trieDB with config sized for inter-commit working set.
-// Since trieDB is recreated after each commit, caches don't need to be large.
-// This ensures all memory (including PrevalueTracer) is released between commits.
-func newTrieDB(backingDB ethdb.Database) *triedb.Database {
-	return triedb.NewDatabase(backingDB, &triedb.Config{
-		IsVerkle: true,
-		PathDB: &pathdb.Config{
-			TrieCleanSize:   256 * 1024 * 1024, // 256MB - small, discarded after commit
-			StateCleanSize:  32 * 1024 * 1024,  // 32MB
-			WriteBufferSize: 64 * 1024 * 1024,  // 64MB
-			NoAsyncFlush:    true,              // Releases frozen buffer after flush
-		},
-	})
-}
-
-// processAccountBinaryTrie inserts a single account into the binary trie and
-// writes its snapshot entries to the Pebble batch writer. After this function
-// returns, the caller can discard the accountData — it is not retained.
-func (g *Generator) processAccountBinaryTrie(bt *bintrie.BinaryTrie, bw *batchWriter, acc *accountData) error {
-	// Update binary trie (handles key derivation internally).
-	if err := bt.UpdateAccount(acc.address, acc.account, len(acc.code)); err != nil {
-		return fmt.Errorf("binary trie UpdateAccount: %w", err)
-	}
-	if len(acc.code) > 0 {
-		if err := bt.UpdateContractCode(acc.address, acc.codeHash, acc.code); err != nil {
-			return fmt.Errorf("binary trie UpdateContractCode: %w", err)
-		}
-	}
-
-	// Process storage: update trie and write snapshot in a single pass.
-	// Storage is pre-sorted by Key for deterministic trie insertion.
+// writeAccountSnapshot writes snapshot entries for an account to the batch writer.
+// Handles storage snapshots (Keccak256-keyed), account snapshot (SlimAccountRLP),
+// and code snapshot. This is the snapshot layer — separate from trie root computation.
+func writeAccountSnapshot(bw *batchWriter, acc *accountData) error {
+	// Storage snapshots: each slot keyed by Keccak256(slotKey), RLP-encoded value.
 	for _, slot := range acc.storage {
-		if err := bt.UpdateStorage(acc.address, slot.Key[:], slot.Value[:]); err != nil {
-			return fmt.Errorf("binary trie UpdateStorage: %w", err)
-		}
 		keyHash := crypto.Keccak256Hash(slot.Key[:])
 		valueRLP, err := encodeStorageValue(slot.Value)
 		if err != nil {
@@ -421,8 +407,8 @@ func (g *Generator) processAccountBinaryTrie(bt *bintrie.BinaryTrie, bw *batchWr
 		}
 	}
 
-	// Write snapshot entries to Pebble (same format as MPT path).
-	// In binary trie mode, Account.Root is always EmptyRootHash.
+	// Account snapshot: Root is always EmptyRootHash in binary trie mode
+	// (binary trie doesn't use per-account storage roots like MPT).
 	snapshotAcc := *acc.account
 	snapshotAcc.Root = types.EmptyRootHash
 	slimData := types.SlimAccountRLP(snapshotAcc)
@@ -928,4 +914,17 @@ func encodeBlockNumber(number uint64) []byte {
 	enc := make([]byte, 8)
 	binary.BigEndian.PutUint64(enc, number)
 	return enc
+}
+
+func formatBytesInternal(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }

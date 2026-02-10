@@ -109,6 +109,9 @@ state-actor \
 | `--workers` | NumCPU | Parallel workers |
 | `--code-size` | 1024 | Average contract code size |
 | `--binary-trie` | false | Generate state for EIP-7864 binary trie mode |
+| `--inject-accounts` | - | Comma-separated hex addresses to pre-fund with 999999999 ETH |
+| `--chain-id` | 0 | Override genesis chainId (0 = use value from genesis.json) |
+| `--target-size` | - | Target total DB size on disk (e.g. `5GB`, `500MB`). Stops when reached. |
 | `--verbose` | false | Verbose output |
 | `--benchmark` | false | Print detailed stats |
 
@@ -121,6 +124,10 @@ state-actor --db ./chaindata --genesis genesis.json --accounts 10000 --contracts
 ```
 
 Binary trie state requires geth to run with `--override.verkle=0` (legacy flag name for EIP-7864).
+
+> **Important:** Binary trie mode requires geth built from the same `go-ethereum` version
+> referenced in this project's `go.mod` (the binary trie key derivation must match). Using a
+> different geth version may produce incompatible state that geth cannot read.
 
 ### Recommended Configurations
 

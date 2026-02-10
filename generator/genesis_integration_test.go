@@ -211,7 +211,7 @@ func TestGenesisAccountsIntegrationBinaryTrie(t *testing.T) {
 
 	// Verify stats
 	expectedAccounts := 1 + 10 // 1 genesis EOA + 10 generated
-	expectedContracts := 1 + 5 // 1 genesis contract + 5 generated
+	expectedContracts := 1 + 5     // 1 genesis contract + 5 generated
 
 	if stats.AccountsCreated != expectedAccounts {
 		t.Errorf("Expected %d accounts, got %d", expectedAccounts, stats.AccountsCreated)
