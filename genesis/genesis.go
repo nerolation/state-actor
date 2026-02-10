@@ -19,6 +19,21 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// prefixWriter wraps a KeyValueWriter to prepend a fixed prefix to all keys.
+// Used to write PathDB metadata into the "v" (verkle) namespace.
+type prefixWriter struct {
+	prefix []byte
+	w      ethdb.KeyValueWriter
+}
+
+func (pw *prefixWriter) Put(key, value []byte) error {
+	return pw.w.Put(append(pw.prefix, key...), value)
+}
+
+func (pw *prefixWriter) Delete(key []byte) error {
+	return pw.w.Delete(append(pw.prefix, key...))
+}
+
 // Genesis represents the genesis block configuration.
 // This is a simplified version of go-ethereum's Genesis struct
 // that handles the JSON format used by ethereum-package and devnets.
@@ -129,7 +144,8 @@ func (g *Genesis) GetAllocCode() map[common.Address][]byte {
 // This is called after state generation with the computed state root.
 // When binaryTrie is true, EnableVerkleAtGenesis is set in the chain config
 // (legacy field name — it actually enables binary trie mode per EIP-7864).
-func WriteGenesisBlock(db ethdb.KeyValueStore, genesis *Genesis, stateRoot common.Hash, binaryTrie bool) (*types.Block, error) {
+// The ancientDir is the path for the freezer/ancient database (e.g. "<chaindata>/ancient").
+func WriteGenesisBlock(db ethdb.KeyValueStore, genesis *Genesis, stateRoot common.Hash, binaryTrie bool, ancientDir string) (*types.Block, error) {
 	if genesis.Config == nil {
 		return nil, fmt.Errorf("genesis has no chain config")
 	}
@@ -236,8 +252,34 @@ func WriteGenesisBlock(db ethdb.KeyValueStore, genesis *Genesis, stateRoot commo
 	rawdb.WriteHeadHeaderHash(batch, block.Hash())
 	rawdb.WriteChainConfig(batch, block.Hash(), chainCfg)
 
+	// PathDB metadata: state ID tracking and snapshot root.
+	// Required for geth's PathDB disk layer initialization (loadLayers).
+	//
+	// In binary trie mode, PathDB namespaces all its data under the "v"
+	// prefix (rawdb.VerklePrefix). A prefixWriter wraps the batch to add
+	// this prefix transparently, so rawdb functions write to the correct keys.
+	var metadataWriter ethdb.KeyValueWriter = batch
+	if binaryTrie {
+		metadataWriter = &prefixWriter{prefix: []byte("v"), w: batch}
+	}
+	rawdb.WriteStateID(metadataWriter, stateRoot, 0)
+	rawdb.WritePersistentStateID(metadataWriter, 0)
+	rawdb.WriteSnapshotRoot(metadataWriter, stateRoot)
+
 	if err := batch.Write(); err != nil {
 		return nil, fmt.Errorf("failed to write genesis block: %w", err)
+	}
+
+	// Initialize the ancient/freezer database. Geth requires the freezer
+	// directory with proper index files to exist, even for a genesis-only
+	// database. rawdb.Open wraps the key-value store with a chain freezer
+	// and creates the necessary .cidx/.ridx/.meta table files.
+	if ancientDir != "" {
+		fdb, err := rawdb.Open(db, rawdb.OpenOptions{Ancient: ancientDir})
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize ancient database: %w", err)
+		}
+		fdb.Close()
 	}
 
 	return block, nil

@@ -7,22 +7,19 @@ import (
 	"log"
 	"math"
 	mrand "math/rand"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
-	"github.com/ethereum/go-ethereum/trie/bintrie"
-	"github.com/ethereum/go-ethereum/triedb"
-	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"github.com/holiman/uint256"
 )
 
@@ -68,6 +65,13 @@ func (g *Generator) DB() ethdb.KeyValueStore {
 
 // Generate generates the state and returns statistics.
 func (g *Generator) Generate() (*Stats, error) {
+	// Binary trie mode uses a streaming approach that processes one account
+	// at a time, avoiding the need to hold all account data in memory.
+	// This reduces peak memory from O(accounts + trie) to O(trie) only.
+	if g.config.TrieMode == TrieModeBinary {
+		return g.generateStreamingBinary()
+	}
+
 	stats := &Stats{}
 	genStart := time.Now()
 
@@ -91,6 +95,345 @@ func (g *Generator) Generate() (*Stats, error) {
 	return stats, nil
 }
 
+// generateStreamingBinary generates state for binary trie mode using a
+// two-phase approach:
+//
+// Phase 1: Generate account/contract/storage data, write snapshot entries to
+// Pebble (via batchWriter), and collect trie entries (key-value pairs) into a
+// flat in-memory slice. Each entry is 64 bytes (32-byte key + 32-byte value).
+//
+// Phase 2: Sort entries by key, then compute the binary trie root hash via
+// recursive divide-and-conquer — grouping by stem, computing StemNode hashes,
+// and building the InternalNode tree. No BinaryTrie object, no disk I/O for
+// trie nodes, no commit/reopen cycles.
+//
+// This approach is analogous to how MPT mode uses StackTrie: sorted input
+// enables streaming construction. It eliminates the 35x penalty from
+// HashedNode disk resolution that plagued the old commit-interval approach.
+//
+// Memory: O(N × 64 bytes) for the entries slice, where N is the total number
+// of trie entries (accounts × 2 + storage slots + code chunks).
+func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
+	stats := &Stats{}
+	start := time.Now()
+
+	if g.config.CommitInterval > 0 && g.config.Verbose {
+		log.Printf("NOTE: --commit-interval is ignored (binary stack trie computes root from sorted entries)")
+	}
+
+	bw := newBatchWriter(g.db, g.config.BatchSize, g.config.Workers)
+	defer bw.close()
+
+	// --- Phase 1: Generate data, write snapshots, write trie entries to temp DB ---
+	//
+	// Instead of collecting entries in an in-memory slice (which grows linearly
+	// with state size), we write each trie entry to a temporary Pebble DB.
+	// Pebble's LSM tree keeps keys sorted automatically, so Phase 2 can
+	// iterate in order without an explicit sort step. Memory stays O(1).
+	tempDir, err := os.MkdirTemp("", "state-actor-sort-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	tempDB, err := pebble.New(tempDir, 128, 64, "temp/", false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp sort DB: %w", err)
+	}
+	defer tempDB.Close()
+
+	tempBatch := tempDB.NewBatch()
+	var entryCount int64
+
+	// writeEntries writes a batch of trie entries to the temp DB.
+	writeEntries := func(entries []trieEntry) error {
+		for i := range entries {
+			if err := tempBatch.Put(entries[i].Key[:], entries[i].Value[:]); err != nil {
+				return err
+			}
+			entryCount++
+			if tempBatch.ValueSize() >= 64*1024*1024 { // flush every 64 MB
+				if err := tempBatch.Write(); err != nil {
+					return err
+				}
+				tempBatch.Reset()
+			}
+		}
+		return nil
+	}
+
+	var lastLogTime = time.Now()
+	logProgress := func(phase string, current, total int, slots int64) {
+		if time.Since(lastLogTime) < 20*time.Second {
+			return
+		}
+		lastLogTime = time.Now()
+		pct := float64(current) / float64(total) * 100
+		log.Printf("[%s] %d/%d (%.1f%%), %d storage slots, %d trie entries",
+			phase, current, total, pct, slots, entryCount)
+	}
+
+	// Track genesis addresses for collision avoidance.
+	genesisAddrs := make(map[common.Address]bool, len(g.config.GenesisAccounts))
+
+	// Reusable entries buffer — collectAccountEntries appends to this,
+	// then writeEntries drains it, then we reset to reuse the backing array.
+	var entryBuf []trieEntry
+
+	// 1a. Genesis alloc accounts.
+	for addr, acc := range g.config.GenesisAccounts {
+		genesisAddrs[addr] = true
+
+		addrHash := crypto.Keccak256Hash(addr[:])
+		codeHash := common.BytesToHash(acc.CodeHash)
+
+		ad := &accountData{
+			address:  addr,
+			addrHash: addrHash,
+			account:  acc,
+		}
+		if storageMap, ok := g.config.GenesisStorage[addr]; ok {
+			ad.storage = mapToSortedSlots(storageMap)
+			stats.StorageSlotsCreated += len(ad.storage)
+		}
+		if code, ok := g.config.GenesisCode[addr]; ok {
+			ad.code = code
+			ad.codeHash = codeHash
+		}
+
+		entryBuf = collectAccountEntries(addr, acc, len(ad.code), ad.code, ad.storage, entryBuf[:0])
+		if err := writeEntries(entryBuf); err != nil {
+			return nil, fmt.Errorf("failed to write genesis trie entries: %w", err)
+		}
+		if err := writeAccountSnapshot(bw, ad); err != nil {
+			return nil, fmt.Errorf("failed to write genesis account %s: %w", addr.Hex(), err)
+		}
+
+		if len(ad.code) > 0 || len(ad.storage) > 0 {
+			stats.ContractsCreated++
+		} else {
+			stats.AccountsCreated++
+		}
+	}
+
+	if g.config.Verbose && len(g.config.GenesisAccounts) > 0 {
+		log.Printf("Included %d genesis alloc accounts (%d EOAs, %d contracts)",
+			len(g.config.GenesisAccounts), stats.AccountsCreated, stats.ContractsCreated)
+	}
+
+	// Inject any explicitly-requested addresses (e.g. Anvil's default account).
+	for _, addr := range g.config.InjectAddresses {
+		if genesisAddrs[addr] {
+			continue
+		}
+		genesisAddrs[addr] = true
+		injectBalance := new(uint256.Int).Mul(uint256.NewInt(999999999), uint256.NewInt(1e18))
+		injectAccount := &types.StateAccount{
+			Nonce:    0,
+			Balance:  injectBalance,
+			Root:     types.EmptyRootHash,
+			CodeHash: types.EmptyCodeHash.Bytes(),
+		}
+		entryBuf = collectAccountEntries(addr, injectAccount, 0, nil, nil, entryBuf[:0])
+		if err := writeEntries(entryBuf); err != nil {
+			return nil, fmt.Errorf("failed to write injected trie entries: %w", err)
+		}
+		ad := &accountData{
+			address:  addr,
+			addrHash: crypto.Keccak256Hash(addr[:]),
+			account:  injectAccount,
+		}
+		if err := writeAccountSnapshot(bw, ad); err != nil {
+			return nil, fmt.Errorf("failed to write injected account %s: %w", addr.Hex(), err)
+		}
+		stats.AccountsCreated++
+		if g.config.Verbose {
+			log.Printf("Injected account %s with %s wei", addr.Hex(), injectBalance.String())
+		}
+	}
+
+	// 1b. EOA generation.
+	for i := 0; i < g.config.NumAccounts; i++ {
+		acc := g.generateEOA()
+		for genesisAddrs[acc.address] {
+			acc = g.generateEOA()
+		}
+
+		entryBuf = collectAccountEntries(acc.address, acc.account, 0, nil, nil, entryBuf[:0])
+		if err := writeEntries(entryBuf); err != nil {
+			return nil, fmt.Errorf("failed to write EOA trie entries: %w", err)
+		}
+		if err := writeAccountSnapshot(bw, acc); err != nil {
+			return nil, fmt.Errorf("failed to write EOA %d: %w", i, err)
+		}
+		stats.AccountsCreated++
+		if len(stats.SampleEOAs) < 3 {
+			stats.SampleEOAs = append(stats.SampleEOAs, acc.address)
+		}
+		logProgress("EOA", i+1, g.config.NumAccounts, 0)
+	}
+
+	// 1c. Contract generation via producer-consumer pipeline.
+	// The bytesPerEntry constant estimates total on-disk size per trie entry
+	// (snapshot data + trie nodes + Pebble overhead). Empirically measured
+	// at ~236 bytes/entry from a 12 GB / 50.8M entry benchmark.
+	const bytesPerEntry uint64 = 240
+
+	slotDistribution := g.generateSlotDistribution()
+
+	done := make(chan struct{})
+	contractCh := make(chan *accountData, 16)
+	go func() {
+		defer close(contractCh)
+		for i := 0; i < g.config.NumContracts; i++ {
+			numSlots := slotDistribution[i]
+			contract := g.generateContract(numSlots)
+			for genesisAddrs[contract.address] {
+				contract = g.generateContract(numSlots)
+			}
+			select {
+			case contractCh <- contract:
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	contractIdx := 0
+	targetReached := false
+	for contract := range contractCh {
+		entryBuf = collectAccountEntries(contract.address, contract.account, len(contract.code), contract.code, contract.storage, entryBuf[:0])
+		if err := writeEntries(entryBuf); err != nil {
+			return nil, fmt.Errorf("failed to write contract trie entries: %w", err)
+		}
+		if err := writeAccountSnapshot(bw, contract); err != nil {
+			return nil, fmt.Errorf("failed to write contract %d: %w", contractIdx, err)
+		}
+		stats.ContractsCreated++
+		stats.StorageSlotsCreated += len(contract.storage)
+		if len(stats.SampleContracts) < 3 {
+			stats.SampleContracts = append(stats.SampleContracts, contract.address)
+		}
+		contractIdx++
+		logProgress("Contract", contractIdx, g.config.NumContracts, int64(stats.StorageSlotsCreated))
+
+		// Check target size after each contract.
+		if g.config.TargetSize > 0 {
+			estimatedSize := uint64(entryCount) * bytesPerEntry
+			if estimatedSize >= g.config.TargetSize {
+				if g.config.Verbose {
+					log.Printf("Target size reached: %d entries × %d ≈ %s (target: %s)",
+						entryCount, bytesPerEntry,
+						formatBytesInternal(estimatedSize),
+						formatBytesInternal(g.config.TargetSize))
+				}
+				targetReached = true
+				close(done)
+				break
+			}
+		}
+	}
+	// Drain producer if we broke early.
+	if targetReached {
+		for range contractCh {
+		}
+	}
+
+	// Flush remaining temp entries and snapshot batches.
+	if tempBatch.ValueSize() > 0 {
+		if err := tempBatch.Write(); err != nil {
+			return nil, fmt.Errorf("failed to flush temp batch: %w", err)
+		}
+	}
+	if err := bw.finish(); err != nil {
+		return nil, fmt.Errorf("failed to finish batch writes: %w", err)
+	}
+
+	// --- Phase 2: Stream sorted entries from temp DB → compute root hash ---
+
+	if g.config.Verbose {
+		log.Printf("Computing root from %d trie entries (streaming, O(depth) memory)...", entryCount)
+	}
+
+	hashStart := time.Now()
+	var nodeDB ethdb.KeyValueStore
+	if g.config.WriteTrieNodes {
+		nodeDB = g.db
+	}
+	iter := tempDB.NewIterator(nil, nil)
+	stateRoot := computeBinaryRootStreaming(iter, nodeDB)
+	if g.config.Verbose {
+		log.Printf("Computed binary trie root in %v", time.Since(hashStart).Round(time.Millisecond))
+	}
+
+	stats.StateRoot = stateRoot
+
+	if err := g.db.Put([]byte("SnapshotRoot"), stateRoot[:]); err != nil {
+		return nil, fmt.Errorf("failed to write snapshot root: %w", err)
+	}
+
+	if g.config.Verbose {
+		log.Printf("State root (binary stack trie): %s", stateRoot.Hex())
+		log.Printf("Generated %d accounts, %d contracts with %d total storage slots (%d trie entries)",
+			stats.AccountsCreated, stats.ContractsCreated, stats.StorageSlotsCreated, entryCount)
+	}
+
+	stats.AccountBytes = bw.accountBytes.Load()
+	stats.StorageBytes = bw.storageBytes.Load()
+	stats.CodeBytes = bw.codeBytes.Load()
+	stats.TotalBytes = stats.AccountBytes + stats.StorageBytes + stats.CodeBytes
+
+	elapsed := time.Since(start)
+	stats.GenerationTime = elapsed
+	stats.DBWriteTime = elapsed
+
+	return stats, nil
+}
+
+// writeAccountSnapshot writes snapshot entries for an account to the batch writer.
+// Handles storage snapshots (Keccak256-keyed), account snapshot (SlimAccountRLP),
+// and code snapshot. This is the snapshot layer — separate from trie root computation.
+func writeAccountSnapshot(bw *batchWriter, acc *accountData) error {
+	// Storage snapshots: each slot keyed by Keccak256(slotKey), RLP-encoded value.
+	for _, slot := range acc.storage {
+		keyHash := crypto.Keccak256Hash(slot.Key[:])
+		valueRLP, err := encodeStorageValue(slot.Value)
+		if err != nil {
+			return fmt.Errorf("encode storage value: %w", err)
+		}
+		storageKey := storageSnapshotKey(acc.addrHash, keyHash)
+		if err := bw.put(storageKey, valueRLP, &bw.storageBytes); err != nil {
+			return fmt.Errorf("snapshot storage write: %w", err)
+		}
+	}
+
+	// Account snapshot: Root is always EmptyRootHash in binary trie mode
+	// (binary trie doesn't use per-account storage roots like MPT).
+	snapshotAcc := *acc.account
+	snapshotAcc.Root = types.EmptyRootHash
+	slimData := types.SlimAccountRLP(snapshotAcc)
+	key := accountSnapshotKey(acc.addrHash)
+	if err := bw.put(key, slimData, &bw.accountBytes); err != nil {
+		return fmt.Errorf("snapshot account write: %w", err)
+	}
+
+	// Code snapshot (same format as MPT).
+	if len(acc.code) > 0 {
+		cKey := codeKey(acc.codeHash)
+		if err := bw.put(cKey, acc.code, &bw.codeBytes); err != nil {
+			return fmt.Errorf("snapshot code write: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// storageSlot is a key-value pair for deterministic storage iteration.
+type storageSlot struct {
+	Key   common.Hash
+	Value common.Hash
+}
+
 // accountData holds generated account data.
 type accountData struct {
 	address   common.Address
@@ -98,7 +441,19 @@ type accountData struct {
 	account   *types.StateAccount
 	code      []byte
 	codeHash  common.Hash
-	storage   map[common.Hash]common.Hash
+	storage   []storageSlot // pre-sorted by Key for deterministic trie insertion
+}
+
+// mapToSortedSlots converts a storage map to a sorted slice of storageSlot.
+func mapToSortedSlots(m map[common.Hash]common.Hash) []storageSlot {
+	slots := make([]storageSlot, 0, len(m))
+	for k, v := range m {
+		slots = append(slots, storageSlot{Key: k, Value: v})
+	}
+	sort.Slice(slots, func(i, j int) bool {
+		return bytes.Compare(slots[i].Key[:], slots[j].Key[:]) < 0
+	})
+	return slots
 }
 
 // generateAccounts generates account and contract data.
@@ -123,9 +478,9 @@ func (g *Generator) generateAccounts(stats *Stats) ([]*accountData, []*accountDa
 		}
 
 		// Include genesis storage if present
-		if storage, ok := g.config.GenesisStorage[addr]; ok {
-			ad.storage = storage
-			stats.StorageSlotsCreated += len(storage)
+		if storageMap, ok := g.config.GenesisStorage[addr]; ok {
+			ad.storage = mapToSortedSlots(storageMap)
+			stats.StorageSlotsCreated += len(ad.storage)
 		}
 
 		// Include genesis code if present
@@ -227,8 +582,8 @@ func (g *Generator) generateContract(numSlots int) *accountData {
 		uint256.NewInt(1e18),
 	)
 
-	// Generate storage slots
-	storage := make(map[common.Hash]common.Hash, numSlots)
+	// Generate storage slots as a pre-sorted slice for deterministic trie insertion.
+	storage := make([]storageSlot, 0, numSlots)
 	for j := 0; j < numSlots; j++ {
 		var key, value common.Hash
 		g.rng.Read(key[:])
@@ -237,8 +592,11 @@ func (g *Generator) generateContract(numSlots int) *accountData {
 		if value == (common.Hash{}) {
 			value[31] = 1
 		}
-		storage[key] = value
+		storage = append(storage, storageSlot{Key: key, Value: value})
 	}
+	sort.Slice(storage, func(i, j int) bool {
+		return bytes.Compare(storage[i].Key[:], storage[j].Key[:]) < 0
+	})
 
 	return &accountData{
 		address:  addr,
@@ -295,10 +653,9 @@ func (g *Generator) generateSlotDistribution() []int {
 }
 
 // writeState dispatches to the appropriate trie-mode-specific writer.
+// Binary trie mode is handled by generateStreamingBinary and never reaches here.
 func (g *Generator) writeState(accounts, contracts []*accountData, stats *Stats) error {
 	switch g.config.TrieMode {
-	case TrieModeBinary:
-		return g.writeStateBinaryTrie(accounts, contracts, stats)
 	case TrieModeMPT, "":
 		return g.writeStateMPT(accounts, contracts, stats)
 	default:
@@ -426,30 +783,28 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 
 	// Process all accounts (EOAs and contracts) in sorted order
 	for _, acc := range allAccounts {
-		// Process storage for contracts
+		// Process storage for contracts.
+		// MPT requires keys sorted by Keccak256(key), not raw key.
 		if len(acc.storage) > 0 {
 			storageTrie := trie.NewStackTrie(nil)
 
-			// Collect storage keys with their hashes
 			type keyWithHash struct {
-				key     common.Hash
+				slot    storageSlot
 				keyHash common.Hash
 			}
-			storageKeys := make([]keyWithHash, 0, len(acc.storage))
-			for key := range acc.storage {
-				storageKeys = append(storageKeys, keyWithHash{
-					key:     key,
-					keyHash: crypto.Keccak256Hash(key[:]),
-				})
+			withHashes := make([]keyWithHash, len(acc.storage))
+			for i, slot := range acc.storage {
+				withHashes[i] = keyWithHash{
+					slot:    slot,
+					keyHash: crypto.Keccak256Hash(slot.Key[:]),
+				}
 			}
-			// Sort by keyHash (StackTrie requires sorted keys)
-			sort.Slice(storageKeys, func(i, j int) bool {
-				return bytes.Compare(storageKeys[i].keyHash[:], storageKeys[j].keyHash[:]) < 0
+			sort.Slice(withHashes, func(i, j int) bool {
+				return bytes.Compare(withHashes[i].keyHash[:], withHashes[j].keyHash[:]) < 0
 			})
 
-			for _, kh := range storageKeys {
-				value := acc.storage[kh.key]
-				valueRLP, err := encodeStorageValue(value)
+			for _, kh := range withHashes {
+				valueRLP, err := encodeStorageValue(kh.slot.Value)
 				if err != nil {
 					return err
 				}
@@ -462,7 +817,6 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 				storageTrie.Update(kh.keyHash[:], valueRLP)
 			}
 
-			// Update account's storage root
 			acc.account.Root = storageTrie.Hash()
 		}
 
@@ -500,127 +854,6 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 
 	if g.config.Verbose {
 		log.Printf("State root: %s", stateRoot.Hex())
-	}
-
-	stats.AccountBytes = bw.accountBytes.Load()
-	stats.StorageBytes = bw.storageBytes.Load()
-	stats.CodeBytes = bw.codeBytes.Load()
-
-	return nil
-}
-
-// writeStateBinaryTrie writes all state using the EIP-7864 binary trie for root computation.
-// The binary trie uses a single global tree (no per-account storage subtries).
-func (g *Generator) writeStateBinaryTrie(accounts, contracts []*accountData, stats *Stats) (retErr error) {
-	// Set up BinaryTrie with an ephemeral in-memory backing store. The trie
-	// nodes are used only for root hash computation and are not persisted —
-	// geth will rebuild the trie from snapshot data on startup.
-	// IsVerkle is a legacy geth field name. Setting it to true enables
-	// EIP-7864 binary trie mode, not the original Verkle trie design.
-	memDB := rawdb.NewMemoryDatabase()
-	defer memDB.Close()
-	trieDB := triedb.NewDatabase(memDB, &triedb.Config{
-		IsVerkle: true,
-		PathDB:   pathdb.Defaults,
-	})
-	defer func() {
-		if err := trieDB.Close(); err != nil && retErr == nil {
-			retErr = fmt.Errorf("failed to close trie database: %w", err)
-		}
-	}()
-
-	bt, err := bintrie.NewBinaryTrie(types.EmptyBinaryHash, trieDB)
-	if err != nil {
-		return fmt.Errorf("failed to create binary trie: %w", err)
-	}
-
-	// Merge all accounts (storage keys sorted per-account for determinism)
-	allAccounts := make([]*accountData, 0, len(accounts)+len(contracts))
-	allAccounts = append(allAccounts, accounts...)
-	allAccounts = append(allAccounts, contracts...)
-
-	bw := newBatchWriter(g.db, g.config.BatchSize, g.config.Workers)
-	defer bw.close()
-
-	for _, acc := range allAccounts {
-		// Insert into binary trie (handles key derivation + encoding internally)
-		if err := bt.UpdateAccount(acc.address, acc.account, len(acc.code)); err != nil {
-			return fmt.Errorf("binary trie UpdateAccount error: %w", err)
-		}
-
-		// Insert contract code into binary trie (handles chunking internally)
-		if len(acc.code) > 0 {
-			if err := bt.UpdateContractCode(acc.address, acc.codeHash, acc.code); err != nil {
-				return fmt.Errorf("binary trie UpdateContractCode error: %w", err)
-			}
-		}
-
-		// Sort storage keys for deterministic insertion order
-		storageKeys := make([]common.Hash, 0, len(acc.storage))
-		for k := range acc.storage {
-			storageKeys = append(storageKeys, k)
-		}
-		sort.Slice(storageKeys, func(i, j int) bool {
-			return bytes.Compare(storageKeys[i][:], storageKeys[j][:]) < 0
-		})
-
-		// Insert storage slots into binary trie
-		for _, slotKey := range storageKeys {
-			slotValue := acc.storage[slotKey]
-			if err := bt.UpdateStorage(acc.address, slotKey[:], slotValue[:]); err != nil {
-				return fmt.Errorf("binary trie UpdateStorage error: %w", err)
-			}
-		}
-
-		// Write snapshot entries to Pebble (same format as MPT path).
-		// In binary trie mode, Account.Root is always EmptyRootHash since
-		// there are no per-account storage subtries.
-		snapshotAcc := *acc.account
-		snapshotAcc.Root = types.EmptyRootHash
-		slimData := types.SlimAccountRLP(snapshotAcc)
-		key := accountSnapshotKey(acc.addrHash)
-		if err := bw.put(key, slimData, &bw.accountBytes); err != nil {
-			return fmt.Errorf("failed to write account snapshot for %s: %w", acc.address.Hex(), err)
-		}
-
-		// Storage snapshots (keccak256-keyed, same as MPT) — reuse sorted keys
-		for _, slotKey := range storageKeys {
-			slotValue := acc.storage[slotKey]
-			keyHash := crypto.Keccak256Hash(slotKey[:])
-			valueRLP, err := encodeStorageValue(slotValue)
-			if err != nil {
-				return fmt.Errorf("failed to encode storage value for %s: %w", acc.address.Hex(), err)
-			}
-			storageKey := storageSnapshotKey(acc.addrHash, keyHash)
-			if err := bw.put(storageKey, valueRLP, &bw.storageBytes); err != nil {
-				return fmt.Errorf("failed to write storage snapshot for %s: %w", acc.address.Hex(), err)
-			}
-		}
-
-		// Code (same format as MPT)
-		if len(acc.code) > 0 {
-			cKey := codeKey(acc.codeHash)
-			if err := bw.put(cKey, acc.code, &bw.codeBytes); err != nil {
-				return fmt.Errorf("failed to write code for %s: %w", acc.address.Hex(), err)
-			}
-		}
-	}
-
-	if err := bw.finish(); err != nil {
-		return fmt.Errorf("failed to finish binary trie batch writes: %w", err)
-	}
-
-	// Compute state root from binary trie
-	stateRoot := bt.Hash()
-	stats.StateRoot = stateRoot
-
-	// Write snapshot root marker
-	if err := g.db.Put([]byte("SnapshotRoot"), stateRoot[:]); err != nil {
-		return fmt.Errorf("failed to write snapshot root: %w", err)
-	}
-
-	if g.config.Verbose {
-		log.Printf("State root (binary trie): %s", stateRoot.Hex())
 	}
 
 	stats.AccountBytes = bw.accountBytes.Load()
@@ -681,4 +914,17 @@ func encodeBlockNumber(number uint64) []byte {
 	enc := make([]byte, 8)
 	binary.BigEndian.PutUint64(enc, number)
 	return enc
+}
+
+func formatBytesInternal(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }

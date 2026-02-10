@@ -16,10 +16,15 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/nerolation/state-actor/generator"
 	"github.com/nerolation/state-actor/genesis"
 )
@@ -37,10 +42,16 @@ var (
 	codeSize     = flag.Int("code-size", 1024, "Average contract code size in bytes")
 	verbose      = flag.Bool("verbose", false, "Verbose output")
 	benchmark    = flag.Bool("benchmark", false, "Run in benchmark mode (print detailed stats)")
-	binaryTrie   = flag.Bool("binary-trie", false, "Generate state for binary trie mode (EIP-7864)")
+	binaryTrie     = flag.Bool("binary-trie", false, "Generate state for binary trie mode (EIP-7864)")
+	commitInterval = flag.Int("commit-interval", 500000, "Binary trie: commit to disk every N trie insertions (default 500K, 0 = all in-memory)")
+
+	// Target size
+	targetSize = flag.String("target-size", "", "Target total DB size on disk (e.g. '5GB', '500MB'). Stops generating when estimated size is reached.")
 
 	// Genesis integration
-	genesisPath = flag.String("genesis", "", "Path to genesis.json file (optional)")
+	genesisPath    = flag.String("genesis", "", "Path to genesis.json file (optional)")
+	injectAccounts = flag.String("inject-accounts", "", "Comma-separated hex addresses to inject with 999999999 ETH (e.g. 0xf39F...2266)")
+	chainID        = flag.Int64("chain-id", 0, "Override genesis chainId (0 = use value from genesis.json)")
 )
 
 func main() {
@@ -65,19 +76,48 @@ func main() {
 		trieMode = generator.TrieModeBinary
 	}
 
+	// Parse --inject-accounts
+	var injectAddrs []common.Address
+	if *injectAccounts != "" {
+		for _, s := range strings.Split(*injectAccounts, ",") {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			if !common.IsHexAddress(s) {
+				log.Fatalf("Invalid address in --inject-accounts: %q", s)
+			}
+			injectAddrs = append(injectAddrs, common.HexToAddress(s))
+		}
+	}
+
+	// Parse --target-size
+	var parsedTargetSize uint64
+	if *targetSize != "" {
+		var err error
+		parsedTargetSize, err = parseSize(*targetSize)
+		if err != nil {
+			log.Fatalf("Invalid --target-size: %v", err)
+		}
+	}
+
 	config := generator.Config{
-		DBPath:       *dbPath,
-		NumAccounts:  *accounts,
-		NumContracts: *contracts,
-		MaxSlots:     *maxSlots,
-		MinSlots:     *minSlots,
-		Distribution: generator.ParseDistribution(*distribution),
-		Seed:         *seed,
-		BatchSize:    *batchSize,
-		Workers:      *workers,
-		CodeSize:     *codeSize,
-		Verbose:      *verbose,
-		TrieMode:     trieMode,
+		DBPath:         *dbPath,
+		NumAccounts:    *accounts,
+		NumContracts:   *contracts,
+		MaxSlots:       *maxSlots,
+		MinSlots:       *minSlots,
+		Distribution:   generator.ParseDistribution(*distribution),
+		Seed:           *seed,
+		BatchSize:      *batchSize,
+		Workers:        *workers,
+		CodeSize:       *codeSize,
+		Verbose:        *verbose,
+		TrieMode:       trieMode,
+		CommitInterval:  *commitInterval,
+		WriteTrieNodes:  *genesisPath != "",
+		InjectAddresses: injectAddrs,
+		TargetSize:      parsedTargetSize,
 	}
 
 	// Load genesis if provided
@@ -94,8 +134,14 @@ func main() {
 		config.GenesisStorage = genesisConfig.GetAllocStorage()
 		config.GenesisCode = genesisConfig.GetAllocCode()
 
+		// Override chain ID if requested
+		if *chainID != 0 {
+			genesisConfig.Config.ChainID = big.NewInt(*chainID)
+		}
+
 		if *verbose {
-			log.Printf("Loaded genesis with %d alloc accounts", len(config.GenesisAccounts))
+			log.Printf("Loaded genesis with %d alloc accounts (chainId=%s)",
+				len(config.GenesisAccounts), genesisConfig.Config.ChainID)
 		}
 	}
 
@@ -112,6 +158,12 @@ func main() {
 		log.Printf("  Workers:      %d", config.Workers)
 		log.Printf("  Code Size:    %d bytes", config.CodeSize)
 		log.Printf("  Trie Mode:    %s", config.TrieMode)
+		if config.CommitInterval > 0 {
+			log.Printf("  Commit Interval: %d trie insertions", config.CommitInterval)
+		}
+		if config.TargetSize > 0 {
+			log.Printf("  Target Size:  %s", formatBytes(config.TargetSize))
+		}
 		if *genesisPath != "" {
 			log.Printf("  Genesis:      %s", *genesisPath)
 		}
@@ -136,7 +188,8 @@ func main() {
 			log.Printf("Writing genesis block with state root: %s", stats.StateRoot.Hex())
 		}
 
-		block, err := genesis.WriteGenesisBlock(gen.DB(), genesisConfig, stats.StateRoot, config.TrieMode == generator.TrieModeBinary)
+		ancientDir := filepath.Join(config.DBPath, "ancient")
+		block, err := genesis.WriteGenesisBlock(gen.DB(), genesisConfig, stats.StateRoot, config.TrieMode == generator.TrieModeBinary, ancientDir)
 		if err != nil {
 			log.Fatalf("Failed to write genesis block: %v", err)
 		}
@@ -172,6 +225,24 @@ func main() {
 		if len(config.GenesisAccounts) > 0 {
 			fmt.Printf("Genesis Accounts:  %d\n", len(config.GenesisAccounts))
 		}
+
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		fmt.Printf("\n=== Memory Stats ===\n")
+		fmt.Printf("Total Alloc:       %s\n", formatBytes(m.TotalAlloc))
+		fmt.Printf("Current Alloc:     %s\n", formatBytes(m.Alloc))
+		fmt.Printf("Sys Memory:        %s\n", formatBytes(m.Sys))
+	}
+
+	// Print sample addresses for verification
+	if len(stats.SampleEOAs) > 0 {
+		fmt.Printf("\n=== Sample Addresses (for verification) ===\n")
+		for i, addr := range stats.SampleEOAs {
+			fmt.Printf("  EOA #%d:      %s\n", i+1, addr.Hex())
+		}
+		for i, addr := range stats.SampleContracts {
+			fmt.Printf("  Contract #%d: %s\n", i+1, addr.Hex())
+		}
 	}
 }
 
@@ -186,4 +257,42 @@ func formatBytes(b uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// parseSize parses a human-readable size string (e.g. "5GB", "500MB", "1TB")
+// into bytes. Supports KB, MB, GB, TB suffixes (case-insensitive, base-1024).
+func parseSize(s string) (uint64, error) {
+	s = strings.TrimSpace(s)
+	upper := strings.ToUpper(s)
+
+	suffixes := []struct {
+		suffix string
+		mult   uint64
+	}{
+		{"TB", 1 << 40},
+		{"GB", 1 << 30},
+		{"MB", 1 << 20},
+		{"KB", 1 << 10},
+	}
+
+	for _, sf := range suffixes {
+		if strings.HasSuffix(upper, sf.suffix) {
+			numStr := strings.TrimSpace(s[:len(s)-len(sf.suffix)])
+			val, err := strconv.ParseFloat(numStr, 64)
+			if err != nil {
+				return 0, fmt.Errorf("invalid number %q in size %q", numStr, s)
+			}
+			if val <= 0 {
+				return 0, fmt.Errorf("size must be positive: %s", s)
+			}
+			return uint64(val * float64(sf.mult)), nil
+		}
+	}
+
+	// Plain number = bytes
+	val, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size format %q (use e.g. '5GB', '500MB')", s)
+	}
+	return val, nil
 }

@@ -115,7 +115,8 @@ func TestEndToEndWithGenesis(t *testing.T) {
 	}
 
 	// Write genesis block
-	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot, false)
+	ancientDir := filepath.Join(config.DBPath, "ancient")
+	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot, false, ancientDir)
 	if err != nil {
 		stateGen.Close()
 		t.Fatalf("Failed to write genesis block: %v", err)
@@ -296,7 +297,8 @@ func TestEndToEndWithGenesisBinaryTrie(t *testing.T) {
 	}
 
 	// Write genesis block with binary trie enabled
-	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot, true)
+	ancientDir2 := filepath.Join(config.DBPath, "ancient")
+	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot, true, ancientDir2)
 	if err != nil {
 		stateGen.Close()
 		t.Fatalf("Failed to write genesis block: %v", err)
@@ -399,7 +401,7 @@ func TestDatabaseReadableByRawDB(t *testing.T) {
 
 	// Write a genesis block
 	stateRoot := common.HexToHash("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
-	block, err := genesis.WriteGenesisBlock(db, &gen, stateRoot, false)
+	block, err := genesis.WriteGenesisBlock(db, &gen, stateRoot, false, "")
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}
