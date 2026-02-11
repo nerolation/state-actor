@@ -26,7 +26,8 @@ import (
 // Generator handles state generation.
 type Generator struct {
 	config Config
-	db     ethdb.KeyValueStore
+	db     ethdb.KeyValueStore // Pebble DB for geth format or temp operations
+	writer StateWriter         // Abstracted writer for output format
 	rng    *mrand.Rand
 }
 
@@ -40,22 +41,74 @@ func New(config Config) (*Generator, error) {
 		return nil, fmt.Errorf("unsupported trie mode: %q", config.TrieMode)
 	}
 
-	// Open Pebble database with reasonable cache settings
-	db, err := pebble.New(config.DBPath, 512, 256, "stategen/", false)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+	// Default to geth format
+	if config.OutputFormat == "" {
+		config.OutputFormat = OutputGeth
+	}
+
+	var db ethdb.KeyValueStore
+	var writer StateWriter
+	var err error
+
+	switch config.OutputFormat {
+	case OutputErigon:
+		// For Erigon, we still need a Pebble DB for binary trie temp storage
+		// and for trie node writes if WriteTrieNodes is enabled
+		if config.TrieMode == TrieModeBinary || config.WriteTrieNodes {
+			db, err = pebble.New(config.DBPath+".geth-temp", 512, 256, "stategen/", false)
+			if err != nil {
+				return nil, fmt.Errorf("failed to open temp database: %w", err)
+			}
+		}
+		writer, err = NewErigonWriter(config.DBPath)
+		if err != nil {
+			if db != nil {
+				db.Close()
+			}
+			return nil, fmt.Errorf("failed to create erigon writer: %w", err)
+		}
+
+	case OutputGeth:
+		fallthrough
+	default:
+		// Geth format: use GethWriter which wraps Pebble
+		gethWriter, err := NewGethWriter(config.DBPath, config.BatchSize, config.Workers)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create geth writer: %w", err)
+		}
+		writer = gethWriter
+		db = gethWriter.DB() // Share the underlying DB for genesis/trie operations
 	}
 
 	return &Generator{
 		config: config,
 		db:     db,
+		writer: writer,
 		rng:    mrand.New(mrand.NewSource(config.Seed)),
 	}, nil
 }
 
 // Close closes the generator and its database.
 func (g *Generator) Close() error {
-	return g.db.Close()
+	var errs []error
+
+	if g.writer != nil {
+		if err := g.writer.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close writer: %w", err))
+		}
+	}
+
+	// For Erigon format, db may be a separate temp DB
+	if g.db != nil && g.config.OutputFormat == OutputErigon {
+		if err := g.db.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close temp db: %w", err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return errs[0]
+	}
+	return nil
 }
 
 // DB returns the underlying database for external writes (e.g., genesis block).
@@ -121,8 +174,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		log.Printf("NOTE: --commit-interval is ignored (binary stack trie computes root from sorted entries)")
 	}
 
-	bw := newBatchWriter(g.db, g.config.BatchSize, g.config.Workers)
-	defer bw.close()
+	// Note: We use g.writer (StateWriter) for final output, not batchWriter
 
 	// --- Phase 1: Generate data, write snapshots, write trie entries to temp DB ---
 	//
@@ -205,7 +257,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		if err := writeEntries(entryBuf); err != nil {
 			return nil, fmt.Errorf("failed to write genesis trie entries: %w", err)
 		}
-		if err := writeAccountSnapshot(bw, ad); err != nil {
+		if err := g.writeAccountSnapshot(ad); err != nil {
 			return nil, fmt.Errorf("failed to write genesis account %s: %w", addr.Hex(), err)
 		}
 
@@ -243,7 +295,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 			addrHash: crypto.Keccak256Hash(addr[:]),
 			account:  injectAccount,
 		}
-		if err := writeAccountSnapshot(bw, ad); err != nil {
+		if err := g.writeAccountSnapshot(ad); err != nil {
 			return nil, fmt.Errorf("failed to write injected account %s: %w", addr.Hex(), err)
 		}
 		stats.AccountsCreated++
@@ -263,7 +315,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		if err := writeEntries(entryBuf); err != nil {
 			return nil, fmt.Errorf("failed to write EOA trie entries: %w", err)
 		}
-		if err := writeAccountSnapshot(bw, acc); err != nil {
+		if err := g.writeAccountSnapshot(acc); err != nil {
 			return nil, fmt.Errorf("failed to write EOA %d: %w", i, err)
 		}
 		stats.AccountsCreated++
@@ -306,7 +358,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		if err := writeEntries(entryBuf); err != nil {
 			return nil, fmt.Errorf("failed to write contract trie entries: %w", err)
 		}
-		if err := writeAccountSnapshot(bw, contract); err != nil {
+		if err := g.writeAccountSnapshot(contract); err != nil {
 			return nil, fmt.Errorf("failed to write contract %d: %w", contractIdx, err)
 		}
 		stats.ContractsCreated++
@@ -339,14 +391,16 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		}
 	}
 
-	// Flush remaining temp entries and snapshot batches.
+	// Flush remaining temp entries.
 	if tempBatch.ValueSize() > 0 {
 		if err := tempBatch.Write(); err != nil {
 			return nil, fmt.Errorf("failed to flush temp batch: %w", err)
 		}
 	}
-	if err := bw.finish(); err != nil {
-		return nil, fmt.Errorf("failed to finish batch writes: %w", err)
+
+	// Flush StateWriter
+	if err := g.writer.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush writer: %w", err)
 	}
 
 	// --- Phase 2: Stream sorted entries from temp DB → compute root hash ---
@@ -357,7 +411,8 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 
 	hashStart := time.Now()
 	var nodeDB ethdb.KeyValueStore
-	if g.config.WriteTrieNodes {
+	// Trie node storage only supported for geth format
+	if g.config.WriteTrieNodes && g.config.OutputFormat == OutputGeth && g.db != nil {
 		nodeDB = g.db
 	}
 	iter := tempDB.NewIterator(nil, nil)
@@ -368,7 +423,8 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 
 	stats.StateRoot = stateRoot
 
-	if err := g.db.Put([]byte("SnapshotRoot"), stateRoot[:]); err != nil {
+	// Write state root via StateWriter
+	if err := g.writer.SetStateRoot(stateRoot); err != nil {
 		return nil, fmt.Errorf("failed to write snapshot root: %w", err)
 	}
 
@@ -378,9 +434,10 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 			stats.AccountsCreated, stats.ContractsCreated, stats.StorageSlotsCreated, entryCount)
 	}
 
-	stats.AccountBytes = bw.accountBytes.Load()
-	stats.StorageBytes = bw.storageBytes.Load()
-	stats.CodeBytes = bw.codeBytes.Load()
+	writerStats := g.writer.Stats()
+	stats.AccountBytes = writerStats.AccountBytes
+	stats.StorageBytes = writerStats.StorageBytes
+	stats.CodeBytes = writerStats.CodeBytes
 	stats.TotalBytes = stats.AccountBytes + stats.StorageBytes + stats.CodeBytes
 
 	elapsed := time.Since(start)
@@ -390,10 +447,38 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	return stats, nil
 }
 
-// writeAccountSnapshot writes snapshot entries for an account to the batch writer.
-// Handles storage snapshots (Keccak256-keyed), account snapshot (SlimAccountRLP),
-// and code snapshot. This is the snapshot layer — separate from trie root computation.
-func writeAccountSnapshot(bw *batchWriter, acc *accountData) error {
+// writeAccountSnapshot writes snapshot entries for an account using the StateWriter.
+// Handles storage, account, and code writes. This is the snapshot layer —
+// separate from trie root computation.
+func (g *Generator) writeAccountSnapshot(acc *accountData) error {
+	// Storage: write each slot via StateWriter
+	for _, slot := range acc.storage {
+		if err := g.writer.WriteStorage(acc.address, 0, slot.Key, slot.Value); err != nil {
+			return fmt.Errorf("write storage: %w", err)
+		}
+	}
+
+	// Account: Root is always EmptyRootHash in binary trie mode
+	// (binary trie doesn't use per-account storage roots like MPT).
+	snapshotAcc := *acc.account
+	snapshotAcc.Root = types.EmptyRootHash
+	if err := g.writer.WriteAccount(acc.address, &snapshotAcc, 0); err != nil {
+		return fmt.Errorf("write account: %w", err)
+	}
+
+	// Code
+	if len(acc.code) > 0 {
+		if err := g.writer.WriteCode(acc.codeHash, acc.code); err != nil {
+			return fmt.Errorf("write code: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// writeAccountSnapshotLegacy writes snapshot entries for an account to the batch writer.
+// Used only for binary trie temp DB operations where we need direct Pebble access.
+func writeAccountSnapshotLegacy(bw *batchWriter, acc *accountData) error {
 	// Storage snapshots: each slot keyed by Keccak256(slotKey), RLP-encoded value.
 	for _, slot := range acc.storage {
 		keyHash := crypto.Keccak256Hash(slot.Key[:])
@@ -767,6 +852,7 @@ func (bw *batchWriter) close() {
 }
 
 // writeStateMPT writes all state to the database using a Merkle Patricia Trie.
+// Uses the StateWriter abstraction for format-agnostic output.
 func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Stats) error {
 	accountTrie := trie.NewStackTrie(nil)
 
@@ -777,9 +863,6 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 	sort.Slice(allAccounts, func(i, j int) bool {
 		return bytes.Compare(allAccounts[i].addrHash[:], allAccounts[j].addrHash[:]) < 0
 	})
-
-	bw := newBatchWriter(g.db, g.config.BatchSize, g.config.Workers)
-	defer bw.close()
 
 	// Process all accounts (EOAs and contracts) in sorted order
 	for _, acc := range allAccounts {
@@ -804,16 +887,16 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 			})
 
 			for _, kh := range withHashes {
+				// Write storage via StateWriter (format-agnostic)
+				if err := g.writer.WriteStorage(acc.address, 0, kh.slot.Key, kh.slot.Value); err != nil {
+					return fmt.Errorf("write storage: %w", err)
+				}
+
+				// Update storage trie for root computation
 				valueRLP, err := encodeStorageValue(kh.slot.Value)
 				if err != nil {
 					return err
 				}
-
-				storageKey := storageSnapshotKey(acc.addrHash, kh.keyHash)
-				if err := bw.put(storageKey, valueRLP, &bw.storageBytes); err != nil {
-					return err
-				}
-
 				storageTrie.Update(kh.keyHash[:], valueRLP)
 			}
 
@@ -822,43 +905,44 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 
 		// Write contract code if present
 		if len(acc.code) > 0 {
-			cKey := codeKey(acc.codeHash)
-			if err := bw.put(cKey, acc.code, &bw.codeBytes); err != nil {
-				return err
+			if err := g.writer.WriteCode(acc.codeHash, acc.code); err != nil {
+				return fmt.Errorf("write code: %w", err)
 			}
 		}
 
-		// Write account snapshot
-		slimData := types.SlimAccountRLP(*acc.account)
-		key := accountSnapshotKey(acc.addrHash)
-		if err := bw.put(key, slimData, &bw.accountBytes); err != nil {
-			return err
+		// Write account via StateWriter (format-agnostic)
+		if err := g.writer.WriteAccount(acc.address, acc.account, 0); err != nil {
+			return fmt.Errorf("write account: %w", err)
 		}
 
-		// Add to account trie
+		// Add to account trie for root computation
+		slimData := types.SlimAccountRLP(*acc.account)
 		accountTrie.Update(acc.addrHash[:], slimData)
 	}
 
-	if err := bw.finish(); err != nil {
-		return err
+	// Flush all pending writes
+	if err := g.writer.Flush(); err != nil {
+		return fmt.Errorf("flush writes: %w", err)
 	}
 
 	// Compute and store state root
 	stateRoot := accountTrie.Hash()
 	stats.StateRoot = stateRoot
 
-	// Write snapshot root marker
-	if err := g.db.Put([]byte("SnapshotRoot"), stateRoot[:]); err != nil {
-		return fmt.Errorf("failed to write snapshot root: %w", err)
+	// Write state root marker via StateWriter
+	if err := g.writer.SetStateRoot(stateRoot); err != nil {
+		return fmt.Errorf("failed to write state root: %w", err)
 	}
 
 	if g.config.Verbose {
 		log.Printf("State root: %s", stateRoot.Hex())
 	}
 
-	stats.AccountBytes = bw.accountBytes.Load()
-	stats.StorageBytes = bw.storageBytes.Load()
-	stats.CodeBytes = bw.codeBytes.Load()
+	// Get stats from writer
+	writerStats := g.writer.Stats()
+	stats.AccountBytes = writerStats.AccountBytes
+	stats.StorageBytes = writerStats.StorageBytes
+	stats.CodeBytes = writerStats.CodeBytes
 
 	return nil
 }

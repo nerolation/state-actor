@@ -435,3 +435,157 @@ func TestDatabaseReadableByRawDB(t *testing.T) {
 		}
 	}
 }
+
+// TestEndToEndErigonFormat tests the Erigon output format.
+func TestEndToEndErigonFormat(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "erigon-e2e-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	config := generator.Config{
+		DBPath:       tmpDir,
+		NumAccounts:  50,
+		NumContracts: 25,
+		MaxSlots:     100,
+		MinSlots:     1,
+		Distribution: generator.PowerLaw,
+		Seed:         42,
+		BatchSize:    1000,
+		Workers:      4,
+		CodeSize:     512,
+		OutputFormat: generator.OutputErigon,
+	}
+
+	gen, err := generator.New(config)
+	if err != nil {
+		t.Fatalf("Failed to create generator: %v", err)
+	}
+
+	stats, err := gen.Generate()
+	if err != nil {
+		gen.Close()
+		t.Fatalf("Failed to generate state: %v", err)
+	}
+
+	if err := gen.Close(); err != nil {
+		t.Fatalf("Failed to close generator: %v", err)
+	}
+
+	// Verify the output
+	if stats.AccountsCreated != 50 {
+		t.Errorf("Expected 50 accounts, got %d", stats.AccountsCreated)
+	}
+	if stats.ContractsCreated != 25 {
+		t.Errorf("Expected 25 contracts, got %d", stats.ContractsCreated)
+	}
+	if stats.StorageSlotsCreated == 0 {
+		t.Error("Expected storage slots to be created")
+	}
+	if stats.StateRoot == (common.Hash{}) {
+		t.Error("Expected non-zero state root")
+	}
+
+	t.Logf("Erigon e2e: accounts=%d, contracts=%d, slots=%d, root=%s",
+		stats.AccountsCreated, stats.ContractsCreated, stats.StorageSlotsCreated, stats.StateRoot.Hex())
+
+	// Verify MDBX database was created
+	if _, err := os.Stat(filepath.Join(tmpDir, "mdbx.dat")); os.IsNotExist(err) {
+		t.Error("MDBX database file not created")
+	}
+}
+
+// TestBothFormatsProduceSameStateRoot verifies that geth and erigon formats
+// produce the same state root for identical input.
+func TestBothFormatsProduceSameStateRoot(t *testing.T) {
+	seed := int64(12345)
+
+	// Generate with geth format
+	gethDir, err := os.MkdirTemp("", "geth-compare-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(gethDir)
+
+	gethConfig := generator.Config{
+		DBPath:       gethDir,
+		NumAccounts:  30,
+		NumContracts: 15,
+		MaxSlots:     50,
+		MinSlots:     1,
+		Distribution: generator.Uniform,
+		Seed:         seed,
+		BatchSize:    1000,
+		Workers:      4,
+		CodeSize:     256,
+		OutputFormat: generator.OutputGeth,
+	}
+
+	gethGen, err := generator.New(gethConfig)
+	if err != nil {
+		t.Fatalf("Failed to create geth generator: %v", err)
+	}
+
+	gethStats, err := gethGen.Generate()
+	gethGen.Close()
+	if err != nil {
+		t.Fatalf("Failed to generate geth state: %v", err)
+	}
+
+	// Generate with erigon format
+	erigonDir, err := os.MkdirTemp("", "erigon-compare-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(erigonDir)
+
+	erigonConfig := generator.Config{
+		DBPath:       erigonDir,
+		NumAccounts:  30,
+		NumContracts: 15,
+		MaxSlots:     50,
+		MinSlots:     1,
+		Distribution: generator.Uniform,
+		Seed:         seed,
+		BatchSize:    1000,
+		Workers:      4,
+		CodeSize:     256,
+		OutputFormat: generator.OutputErigon,
+	}
+
+	erigonGen, err := generator.New(erigonConfig)
+	if err != nil {
+		t.Fatalf("Failed to create erigon generator: %v", err)
+	}
+
+	erigonStats, err := erigonGen.Generate()
+	erigonGen.Close()
+	if err != nil {
+		t.Fatalf("Failed to generate erigon state: %v", err)
+	}
+
+	// State roots should be identical
+	if gethStats.StateRoot != erigonStats.StateRoot {
+		t.Errorf("State root mismatch:\n  geth:   %s\n  erigon: %s",
+			gethStats.StateRoot.Hex(), erigonStats.StateRoot.Hex())
+	}
+
+	// Stats should be identical
+	if gethStats.AccountsCreated != erigonStats.AccountsCreated {
+		t.Errorf("Account count mismatch: geth=%d, erigon=%d",
+			gethStats.AccountsCreated, erigonStats.AccountsCreated)
+	}
+	if gethStats.ContractsCreated != erigonStats.ContractsCreated {
+		t.Errorf("Contract count mismatch: geth=%d, erigon=%d",
+			gethStats.ContractsCreated, erigonStats.ContractsCreated)
+	}
+	if gethStats.StorageSlotsCreated != erigonStats.StorageSlotsCreated {
+		t.Errorf("Storage slot count mismatch: geth=%d, erigon=%d",
+			gethStats.StorageSlotsCreated, erigonStats.StorageSlotsCreated)
+	}
+
+	t.Logf("Both formats produced identical state root: %s", gethStats.StateRoot.Hex())
+	t.Logf("Stats: accounts=%d, contracts=%d, slots=%d",
+		gethStats.AccountsCreated, gethStats.ContractsCreated, gethStats.StorageSlotsCreated)
+}
