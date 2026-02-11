@@ -8,6 +8,7 @@ import (
 	"math"
 	mrand "math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -529,14 +530,27 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	}
 
 	var lastLogTime = time.Now()
+	var lastProjectedSize uint64 // cached from most recent dirSize check
 	logProgress := func(phase string, current, total int, slots int64) {
 		if time.Since(lastLogTime) < 20*time.Second {
 			return
 		}
 		lastLogTime = time.Now()
-		pct := float64(current) / float64(total) * 100
-		log.Printf("[%s] %d/%d (%.1f%%), %d storage slots, %d trie entries",
-			phase, current, total, pct, slots, entryCount)
+		if g.config.TargetSize > 0 && g.config.NumContracts >= math.MaxInt32 {
+			pct := float64(lastProjectedSize) / float64(g.config.TargetSize) * 100
+			if pct > 100 {
+				pct = 100
+			}
+			log.Printf("[%s] %.1f%% of target (%s / %s), %d contracts, %d storage slots, %d trie entries",
+				phase, pct,
+				formatBytesInternal(lastProjectedSize),
+				formatBytesInternal(g.config.TargetSize),
+				current, slots, entryCount)
+		} else {
+			pct := float64(current) / float64(total) * 100
+			log.Printf("[%s] %d/%d (%.1f%%), %d storage slots, %d trie entries",
+				phase, current, total, pct, slots, entryCount)
+		}
 	}
 
 	// Track genesis addresses for collision avoidance.
@@ -650,19 +664,26 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	}
 
 	// 1c. Contract generation via producer-consumer pipeline.
-	// The bytesPerEntry constant estimates total on-disk size per trie entry
-	// (snapshot data + trie nodes + Pebble overhead). Empirically measured
-	// at ~236 bytes/entry from a 12 GB / 50.8M entry benchmark.
-	const bytesPerEntry uint64 = 240
-
-	slotDistribution := g.generateSlotDistribution()
+	// When --target-size governs, slot counts are generated on-demand
+	// (one RNG call per contract, same sequence as generateSlotDistribution).
+	// When --contracts governs, we pre-compute the distribution for the
+	// known count.
+	var slotDistribution []int
+	if g.config.NumContracts < math.MaxInt32 {
+		slotDistribution = g.generateSlotDistribution()
+	}
 
 	done := make(chan struct{})
 	contractCh := make(chan *accountData, 16)
 	go func() {
 		defer close(contractCh)
 		for i := 0; i < g.config.NumContracts; i++ {
-			numSlots := slotDistribution[i]
+			var numSlots int
+			if slotDistribution != nil {
+				numSlots = slotDistribution[i]
+			} else {
+				numSlots = g.generateSlotCount()
+			}
 			contract := g.generateContract(numSlots)
 			for genesisAddrs[contract.address] {
 				contract = g.generateContract(numSlots)
@@ -677,6 +698,10 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 
 	if g.config.LiveStats != nil {
 		g.config.LiveStats.SetPhase("contracts")
+	}
+	targetCheckInterval := 500
+	if g.config.NumContracts < 500*5 {
+		targetCheckInterval = max(1, g.config.NumContracts/5)
 	}
 	contractIdx := 0
 	targetReached := false
@@ -703,19 +728,28 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		contractIdx++
 		logProgress("Contract", contractIdx, g.config.NumContracts, int64(stats.StorageSlotsCreated))
 
-		// Check target size after each contract.
-		if g.config.TargetSize > 0 {
-			estimatedSize := uint64(entryCount) * bytesPerEntry
-			if estimatedSize >= g.config.TargetSize {
-				if g.config.Verbose {
-					log.Printf("Target size reached: %d entries × %d ≈ %s (target: %s)",
-						entryCount, bytesPerEntry,
-						formatBytesInternal(estimatedSize),
-						formatBytesInternal(g.config.TargetSize))
+		// Check target size periodically using actual disk measurement.
+		if g.config.TargetSize > 0 && contractIdx%targetCheckInterval == 0 {
+			mainDBSize, err := dirSize(g.config.DBPath)
+			if err == nil {
+				// Project trie node overhead: empirically, trie nodes add
+				// ~1.5× the snapshot data, so total ≈ 2.5× snapshot.
+				projected := mainDBSize
+				if g.config.WriteTrieNodes {
+					projected = mainDBSize * 5 / 2
 				}
-				targetReached = true
-				close(done)
-				break
+				lastProjectedSize = projected
+				if projected >= g.config.TargetSize {
+					if g.config.Verbose {
+						log.Printf("Target size reached: DB %s × 2.5 = %s (target: %s)",
+							formatBytesInternal(mainDBSize),
+							formatBytesInternal(projected),
+							formatBytesInternal(g.config.TargetSize))
+					}
+					targetReached = true
+					close(done)
+					break
+				}
 			}
 		}
 	}
@@ -750,7 +784,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		nodeDB = g.db
 	}
 	iter := tempDB.NewIterator(nil, nil)
-	stateRoot := computeBinaryRootStreaming(iter, nodeDB)
+	stateRoot, tnStats := computeBinaryRootStreaming(iter, nodeDB)
 	if g.config.Verbose {
 		log.Printf("Computed binary trie root in %v", time.Since(hashStart).Round(time.Millisecond))
 	}
@@ -772,7 +806,8 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	stats.AccountBytes = writerStats.AccountBytes
 	stats.StorageBytes = writerStats.StorageBytes
 	stats.CodeBytes = writerStats.CodeBytes
-	stats.TotalBytes = stats.AccountBytes + stats.StorageBytes + stats.CodeBytes
+	stats.TrieNodeBytes = uint64(tnStats.Bytes)
+	stats.TotalBytes = stats.AccountBytes + stats.StorageBytes + stats.CodeBytes + stats.TrieNodeBytes
 
 	elapsed := time.Since(start)
 	stats.GenerationTime = elapsed
@@ -1089,6 +1124,48 @@ func (g *Generator) generateSlotDistribution() []int {
 	}
 
 	return distribution
+}
+
+// generateSlotCount generates the slot count for a single contract using
+// the configured distribution. Called from the producer goroutine (which
+// owns the RNG). Each call consumes exactly 1 RNG call, so the sequence
+// is identical to generateSlotDistribution for the same seed.
+func (g *Generator) generateSlotCount() int {
+	switch g.config.Distribution {
+	case PowerLaw:
+		alpha := 1.5
+		u := g.rng.Float64()
+		slots := float64(g.config.MinSlots) / math.Pow(1-u, 1/alpha)
+		if slots > float64(g.config.MaxSlots) {
+			slots = float64(g.config.MaxSlots)
+		}
+		return int(slots)
+	case Exponential:
+		lambda := math.Log(2) / float64(g.config.MaxSlots/4)
+		u := g.rng.Float64()
+		slots := -math.Log(1-u) / lambda
+		slots = math.Max(float64(g.config.MinSlots), math.Min(slots, float64(g.config.MaxSlots)))
+		return int(slots)
+	case Uniform:
+		return g.config.MinSlots + g.rng.Intn(g.config.MaxSlots-g.config.MinSlots+1)
+	default:
+		return g.config.MinSlots
+	}
+}
+
+// dirSize returns the total size of all files in a directory tree.
+func dirSize(path string) (uint64, error) {
+	var total uint64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			total += uint64(info.Size())
+		}
+		return nil
+	})
+	return total, err
 }
 
 // writeState dispatches to the appropriate trie-mode-specific writer.

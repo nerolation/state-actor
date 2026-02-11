@@ -115,9 +115,9 @@ type Config struct {
 	InjectAddresses []common.Address
 
 	// TargetSize is the target total database size on disk in bytes.
-	// When set (> 0), the generator stops creating contracts once the
-	// estimated on-disk size reaches this target. NumAccounts and
-	// NumContracts serve as upper bounds. 0 means no size limit.
+	// When set (> 0), this is the GOVERNING constraint: contracts are
+	// generated until the projected on-disk size reaches this target.
+	// NumContracts serves as a safety upper bound. 0 means no size limit.
 	TargetSize uint64
 
 	// OutputFormat specifies the database format to generate.
@@ -151,6 +151,10 @@ type Stats struct {
 
 	// CodeBytes is the number of bytes for contract code.
 	CodeBytes uint64
+
+	// TrieNodeBytes is the number of bytes written for trie nodes (Phase 2).
+	// Only populated when WriteTrieNodes is true.
+	TrieNodeBytes uint64
 
 	// StateRoot is the computed state root hash.
 	StateRoot common.Hash
