@@ -18,7 +18,7 @@
 
 ---
 
-State Actor generates realistic Ethereum state directly into geth-compatible Pebble databases. Create bloated devnets with millions of accounts and storage slots to test client behavior under mainnet-like conditions.
+State Actor generates realistic Ethereum state directly into client-compatible databases. Supports both **geth** (Pebble/snapshot) and **Erigon** (MDBX/PlainState) formats. Create bloated devnets with millions of accounts and storage slots to test client behavior under mainnet-like conditions.
 
 ## Quick Start
 
@@ -26,13 +26,20 @@ State Actor generates realistic Ethereum state directly into geth-compatible Peb
 # Install
 go install github.com/nerolation/state-actor@latest
 
-# Generate 10K accounts + 5K contracts with ~100K storage slots
+# Generate for geth (default)
 state-actor \
     --db ./chaindata \
     --genesis genesis.json \
     --accounts 10000 \
     --contracts 5000 \
-    --max-slots 1000 \
+    --seed 42
+
+# Generate for Erigon
+state-actor \
+    --db ./erigon-data \
+    --accounts 10000 \
+    --contracts 5000 \
+    --output-format erigon \
     --seed 42
 
 # Output:
@@ -52,6 +59,7 @@ state-actor \
 | 🔗 **Genesis Integration** | Merges with genesis.json, writes genesis block |
 | 📦 **Ready to Use** | No `geth init` needed |
 | 🐳 **Docker Ready** | Pre-built images available |
+| 🔀 **Multi-Client** | Supports geth (Pebble) and Erigon (MDBX) |
 
 ## Installation
 
@@ -99,6 +107,7 @@ state-actor \
 |------|---------|-------------|
 | `--db` | (required) | Output database directory |
 | `--genesis` | - | Genesis JSON file (enables genesis block writing) |
+| `--output-format` | geth | Output format: `geth` (Pebble) or `erigon` (MDBX) |
 | `--accounts` | 1000 | Number of EOA accounts |
 | `--contracts` | 100 | Number of contracts |
 | `--max-slots` | 10000 | Max storage slots per contract |
@@ -114,6 +123,33 @@ state-actor \
 | `--target-size` | - | Target total DB size on disk (e.g. `5GB`, `500MB`). Stops when reached. |
 | `--verbose` | false | Verbose output |
 | `--benchmark` | false | Print detailed stats |
+
+### Output Formats
+
+State Actor supports two database formats:
+
+#### Geth (default)
+Generates a Pebble database with geth's snapshot layer format. Ready to use with `geth --db.engine=pebble`.
+
+```bash
+state-actor --db ./chaindata --output-format geth --genesis genesis.json ...
+```
+
+#### Erigon
+Generates an MDBX database with Erigon's PlainState format. Ready to use with Erigon.
+
+```bash
+state-actor --db ./erigon-data --output-format erigon ...
+```
+
+| Aspect | Geth | Erigon |
+|--------|------|--------|
+| Database | Pebble | MDBX |
+| Account key | `a` + keccak(addr) | addr (20 bytes) |
+| Storage key | `o` + keccak(addr) + keccak(slot) | addr + incarnation + slot |
+| Encoding | SlimAccountRLP | SerialiseV3 (fieldset) |
+
+> **Note:** Both formats produce identical state roots for the same seed, ensuring reproducibility across clients.
 
 ### Trie Modes
 
@@ -259,28 +295,43 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture docum
 │              Generator                  │
 │  • Genesis accounts + Generated state   │
 │  • StackTrie (MPT) or BinaryTrie root   │
-│  • Parallel batch writers               │
+│  • StateWriter abstraction              │
 └────────────────────┬────────────────────┘
-                     ▼
-┌─────────────────────────────────────────┐
-│           Pebble Database               │
-│  • Snapshot layer (a/o/c prefixes)      │
-│  • Genesis block + chain config         │
-└─────────────────────────────────────────┘
+                     │
+         ┌───────────┴───────────┐
+         ▼                       ▼
+┌─────────────────┐     ┌─────────────────┐
+│   GethWriter    │     │  ErigonWriter   │
+│   (Pebble)      │     │   (MDBX)        │
+│   Snapshot fmt  │     │  PlainState fmt │
+└─────────────────┘     └─────────────────┘
 ```
 
 ## Database Schema
 
-State Actor writes to geth's snapshot layer format:
+### Geth Format (Pebble)
+
+Snapshot layer format:
 
 | Key | Value |
 |-----|-------|
-| `a` + hash(addr) | SlimAccountRLP |
-| `o` + hash(addr) + hash(slot) | RLP(value) |
-| `c` + hash(code) | bytecode |
+| `a` + keccak(addr) | SlimAccountRLP |
+| `o` + keccak(addr) + keccak(slot) | RLP(value) |
+| `c` + keccak(code) | bytecode |
 | `SnapshotRoot` | state root |
 
 Plus genesis metadata when `--genesis` is provided.
+
+### Erigon Format (MDBX)
+
+PlainState format:
+
+| Table | Key | Value |
+|-------|-----|-------|
+| PlainState | addr (20 bytes) | SerialiseV3 account |
+| PlainState | addr + incarnation (8) + slot (32) | trimmed value |
+| Code | codeHash (32 bytes) | bytecode |
+| Config | `StateRoot` | state root |
 
 ## Testing
 
