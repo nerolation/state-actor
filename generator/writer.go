@@ -15,6 +15,9 @@ const (
 
 	// OutputErigon generates an Erigon-compatible MDBX database (PlainState).
 	OutputErigon OutputFormat = "erigon"
+
+	// OutputReth generates a Reth-compatible database via the reth-import subprocess.
+	OutputReth OutputFormat = "reth"
 )
 
 // ParseOutputFormat parses an output format string.
@@ -22,6 +25,8 @@ func ParseOutputFormat(s string) OutputFormat {
 	switch s {
 	case "erigon":
 		return OutputErigon
+	case "reth":
+		return OutputReth
 	default:
 		return OutputGeth
 	}

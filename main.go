@@ -56,7 +56,8 @@ var (
 	chainID        = flag.Int64("chain-id", 0, "Override genesis chainId (0 = use value from genesis.json)")
 
 	// Output format
-	outputFormat = flag.String("output-format", "geth", "Output database format: 'geth' (Pebble) or 'erigon' (MDBX)")
+	outputFormat   = flag.String("output-format", "geth", "Output database format: 'geth' (Pebble), 'erigon' (MDBX), or 'reth' (via reth-import)")
+	rethImportBin  = flag.String("reth-import-bin", "", "Path to reth-import binary (default: auto-detect)")
 
 	// Stats server
 	statsPort = flag.Int("stats-port", 0, "Port for live stats HTTP server (0 = disabled)")
@@ -142,6 +143,16 @@ func main() {
 		TargetSize:      parsedTargetSize,
 		OutputFormat:    generator.ParseOutputFormat(*outputFormat),
 		LiveStats:       liveStats,
+		RethImportBin:   *rethImportBin,
+	}
+
+	// Read raw genesis JSON for reth streaming
+	if *genesisPath != "" && config.OutputFormat == generator.OutputReth {
+		genesisBytes, err := os.ReadFile(*genesisPath)
+		if err != nil {
+			log.Fatalf("Failed to read genesis JSON: %v", err)
+		}
+		config.GenesisJSON = genesisBytes
 	}
 
 	// Load genesis if provided
@@ -213,8 +224,8 @@ func main() {
 		liveStats.SetStateRoot(stats.StateRoot.Hex())
 	}
 
-	// Write genesis block if genesis was provided
-	if genesisConfig != nil {
+	// Write genesis block if genesis was provided (Reth handles this on the Rust side)
+	if genesisConfig != nil && config.OutputFormat != generator.OutputReth {
 		if *verbose {
 			log.Printf("Writing genesis block with state root: %s", stats.StateRoot.Hex())
 		}

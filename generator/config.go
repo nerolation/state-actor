@@ -127,6 +127,14 @@ type Config struct {
 	// LiveStats is an optional live stats tracker for real-time monitoring.
 	// When set, the generator updates stats during generation.
 	LiveStats *LiveStats
+
+	// GenesisJSON is the raw genesis JSON bytes to embed in the reth stream header.
+	// Only used with OutputReth.
+	GenesisJSON []byte
+
+	// RethImportBin is the path to the reth-import binary.
+	// If empty, looks in the same directory as the state-actor binary, then PATH.
+	RethImportBin string
 }
 
 // Stats holds statistics about the generation process.

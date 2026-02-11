@@ -1,0 +1,30 @@
+[package]
+name = "reth-import"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+# Reth crates (local path dependencies)
+reth-chainspec = { path = "../../clients/reth/crates/chainspec" }
+reth-db = { path = "../../clients/reth/crates/storage/db" }
+reth-db-api = { path = "../../clients/reth/crates/storage/db-api" }
+reth-db-models = { path = "../../clients/reth/crates/storage/db-models" }
+reth-primitives-traits = { path = "../../clients/reth/crates/primitives-traits" }
+reth-stages-types = { path = "../../clients/reth/crates/stages/types" }
+reth-trie = { path = "../../clients/reth/crates/trie/trie" }
+reth-trie-db = { path = "../../clients/reth/crates/trie/db" }
+reth-trie-common = { path = "../../clients/reth/crates/trie/common" }
+
+# Alloy (must match Reth workspace versions exactly for type unification)
+alloy-consensus = { version = "1.6.3", features = ["std"] }
+alloy-genesis = { version = "1.6.3", features = ["std"] }
+alloy-primitives = { version = "1.5.4", features = ["std", "serde", "map-foldhash"] }
+alloy-trie = { version = "0.9.4" }
+
+# CLI and error handling
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
