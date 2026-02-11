@@ -119,6 +119,10 @@ type Config struct {
 	// estimated on-disk size reaches this target. NumAccounts and
 	// NumContracts serve as upper bounds. 0 means no size limit.
 	TargetSize uint64
+
+	// OutputFormat specifies the database format to generate.
+	// Defaults to OutputGeth if empty.
+	OutputFormat OutputFormat
 }
 
 // Stats holds statistics about the generation process.

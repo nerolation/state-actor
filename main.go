@@ -52,6 +52,9 @@ var (
 	genesisPath    = flag.String("genesis", "", "Path to genesis.json file (optional)")
 	injectAccounts = flag.String("inject-accounts", "", "Comma-separated hex addresses to inject with 999999999 ETH (e.g. 0xf39F...2266)")
 	chainID        = flag.Int64("chain-id", 0, "Override genesis chainId (0 = use value from genesis.json)")
+
+	// Output format
+	outputFormat = flag.String("output-format", "geth", "Output database format: 'geth' (Pebble) or 'erigon' (MDBX)")
 )
 
 func main() {
@@ -102,22 +105,23 @@ func main() {
 	}
 
 	config := generator.Config{
-		DBPath:         *dbPath,
-		NumAccounts:    *accounts,
-		NumContracts:   *contracts,
-		MaxSlots:       *maxSlots,
-		MinSlots:       *minSlots,
-		Distribution:   generator.ParseDistribution(*distribution),
-		Seed:           *seed,
-		BatchSize:      *batchSize,
-		Workers:        *workers,
-		CodeSize:       *codeSize,
-		Verbose:        *verbose,
-		TrieMode:       trieMode,
+		DBPath:          *dbPath,
+		NumAccounts:     *accounts,
+		NumContracts:    *contracts,
+		MaxSlots:        *maxSlots,
+		MinSlots:        *minSlots,
+		Distribution:    generator.ParseDistribution(*distribution),
+		Seed:            *seed,
+		BatchSize:       *batchSize,
+		Workers:         *workers,
+		CodeSize:        *codeSize,
+		Verbose:         *verbose,
+		TrieMode:        trieMode,
 		CommitInterval:  *commitInterval,
 		WriteTrieNodes:  *genesisPath != "",
 		InjectAddresses: injectAddrs,
 		TargetSize:      parsedTargetSize,
+		OutputFormat:    generator.ParseOutputFormat(*outputFormat),
 	}
 
 	// Load genesis if provided
@@ -148,6 +152,7 @@ func main() {
 	if *verbose {
 		log.Printf("Configuration:")
 		log.Printf("  Database:     %s", config.DBPath)
+		log.Printf("  Output Format: %s", config.OutputFormat)
 		log.Printf("  Accounts:     %d", config.NumAccounts)
 		log.Printf("  Contracts:    %d", config.NumContracts)
 		log.Printf("  Max Slots:    %d", config.MaxSlots)
