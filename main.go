@@ -55,6 +55,9 @@ var (
 
 	// Output format
 	outputFormat = flag.String("output-format", "geth", "Output database format: 'geth' (Pebble) or 'erigon' (MDBX)")
+
+	// Stats server
+	statsPort = flag.Int("stats-port", 0, "Port for live stats HTTP server (0 = disabled)")
 )
 
 func main() {
@@ -104,6 +107,20 @@ func main() {
 		}
 	}
 
+	// Start stats server if requested
+	var statsServer *generator.StatsServer
+	var liveStats *generator.LiveStats
+	if *statsPort > 0 {
+		statsServer = generator.NewStatsServer(*statsPort)
+		liveStats = statsServer.Stats()
+		liveStats.SetConfig(*accounts, *contracts, *outputFormat, *distribution, *seed)
+		if err := statsServer.Start(); err != nil {
+			log.Fatalf("Failed to start stats server: %v", err)
+		}
+		log.Printf("Stats server running on http://localhost:%d", *statsPort)
+		defer statsServer.Stop()
+	}
+
 	config := generator.Config{
 		DBPath:          *dbPath,
 		NumAccounts:     *accounts,
@@ -122,6 +139,7 @@ func main() {
 		InjectAddresses: injectAddrs,
 		TargetSize:      parsedTargetSize,
 		OutputFormat:    generator.ParseOutputFormat(*outputFormat),
+		LiveStats:       liveStats,
 	}
 
 	// Load genesis if provided
@@ -185,6 +203,12 @@ func main() {
 	stats, err := gen.Generate()
 	if err != nil {
 		log.Fatalf("Failed to generate state: %v", err)
+	}
+
+	// Update live stats with final state
+	if liveStats != nil {
+		liveStats.AddBytes(int64(stats.AccountBytes), int64(stats.StorageBytes), int64(stats.CodeBytes))
+		liveStats.SetStateRoot(stats.StateRoot.Hex())
 	}
 
 	// Write genesis block if genesis was provided

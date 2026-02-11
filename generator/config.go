@@ -123,6 +123,10 @@ type Config struct {
 	// OutputFormat specifies the database format to generate.
 	// Defaults to OutputGeth if empty.
 	OutputFormat OutputFormat
+
+	// LiveStats is an optional live stats tracker for real-time monitoring.
+	// When set, the generator updates stats during generation.
+	LiveStats *LiveStats
 }
 
 // Stats holds statistics about the generation process.

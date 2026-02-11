@@ -305,6 +305,9 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	}
 
 	// 1b. EOA generation.
+	if g.config.LiveStats != nil {
+		g.config.LiveStats.SetPhase("accounts")
+	}
 	for i := 0; i < g.config.NumAccounts; i++ {
 		acc := g.generateEOA()
 		for genesisAddrs[acc.address] {
@@ -319,6 +322,9 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 			return nil, fmt.Errorf("failed to write EOA %d: %w", i, err)
 		}
 		stats.AccountsCreated++
+		if g.config.LiveStats != nil {
+			g.config.LiveStats.AddAccount()
+		}
 		if len(stats.SampleEOAs) < 3 {
 			stats.SampleEOAs = append(stats.SampleEOAs, acc.address)
 		}
@@ -351,6 +357,9 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		}
 	}()
 
+	if g.config.LiveStats != nil {
+		g.config.LiveStats.SetPhase("contracts")
+	}
 	contractIdx := 0
 	targetReached := false
 	for contract := range contractCh {
@@ -363,6 +372,9 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		}
 		stats.ContractsCreated++
 		stats.StorageSlotsCreated += len(contract.storage)
+		if g.config.LiveStats != nil {
+			g.config.LiveStats.AddContract(len(contract.storage))
+		}
 		if len(stats.SampleContracts) < 3 {
 			stats.SampleContracts = append(stats.SampleContracts, contract.address)
 		}
@@ -590,6 +602,11 @@ func (g *Generator) generateAccounts(stats *Stats) ([]*accountData, []*accountDa
 			len(g.config.GenesisAccounts), genesisAccountCount, genesisContractCount)
 	}
 
+	// Update live stats phase
+	if g.config.LiveStats != nil {
+		g.config.LiveStats.SetPhase("accounts")
+	}
+
 	// Generate additional EOA accounts
 	for i := 0; i < g.config.NumAccounts; i++ {
 		acc := g.generateEOA()
@@ -599,8 +616,18 @@ func (g *Generator) generateAccounts(stats *Stats) ([]*accountData, []*accountDa
 		}
 		usedAddresses[acc.address] = true
 		accounts = append(accounts, acc)
+
+		// Update live stats
+		if g.config.LiveStats != nil {
+			g.config.LiveStats.AddAccount()
+		}
 	}
 	stats.AccountsCreated = len(accounts)
+
+	// Update live stats phase
+	if g.config.LiveStats != nil {
+		g.config.LiveStats.SetPhase("contracts")
+	}
 
 	// Generate contract accounts with storage
 	slotDistribution := g.generateSlotDistribution()
@@ -615,6 +642,11 @@ func (g *Generator) generateAccounts(stats *Stats) ([]*accountData, []*accountDa
 		usedAddresses[contract.address] = true
 		contracts = append(contracts, contract)
 		stats.StorageSlotsCreated += len(contract.storage)
+
+		// Update live stats
+		if g.config.LiveStats != nil {
+			g.config.LiveStats.AddContract(len(contract.storage))
+		}
 	}
 	stats.ContractsCreated = len(contracts)
 
