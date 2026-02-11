@@ -117,28 +117,36 @@ func (g *Generator) DB() ethdb.KeyValueStore {
 }
 
 // Generate generates the state and returns statistics.
+// Both MPT and binary trie modes now use streaming approaches to support
+// states larger than available RAM.
 func (g *Generator) Generate() (*Stats, error) {
-	// Binary trie mode uses a streaming approach that processes one account
-	// at a time, avoiding the need to hold all account data in memory.
-	// This reduces peak memory from O(accounts + trie) to O(trie) only.
 	if g.config.TrieMode == TrieModeBinary {
 		return g.generateStreamingBinary()
 	}
+	// MPT mode also uses streaming to support large states
+	return g.generateStreamingMPT()
+}
 
+// generateStreamingMPT generates state for MPT mode using a streaming approach.
+// Instead of generating all accounts/contracts in memory, it:
+// 1. Generates lightweight metadata (addresses, slot counts)
+// 2. Processes each account one at a time: generate storage → compute storage root → write → discard
+// This reduces peak memory from O(total_storage_slots) to O(max_slots_per_contract).
+func (g *Generator) generateStreamingMPT() (*Stats, error) {
 	stats := &Stats{}
-	genStart := time.Now()
+	start := time.Now()
 
-	// Generate accounts and contracts
-	accounts, contracts, err := g.generateAccounts(stats)
+	// Phase 1: Generate account metadata (no storage data yet)
+	metas, err := g.generateAccountMetas(stats)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate accounts: %w", err)
+		return nil, fmt.Errorf("failed to generate account metadata: %w", err)
 	}
 
-	stats.GenerationTime = time.Since(genStart)
+	stats.GenerationTime = time.Since(start)
 	writeStart := time.Now()
 
-	// Write to database
-	if err := g.writeState(accounts, contracts, stats); err != nil {
+	// Phase 2: Stream-write state in sorted order
+	if err := g.streamWriteStateMPT(metas, stats); err != nil {
 		return nil, fmt.Errorf("failed to write state: %w", err)
 	}
 
@@ -146,6 +154,312 @@ func (g *Generator) Generate() (*Stats, error) {
 	stats.TotalBytes = stats.AccountBytes + stats.StorageBytes + stats.CodeBytes
 
 	return stats, nil
+}
+
+// accountMeta holds lightweight account metadata without storage data.
+// This allows us to generate addresses and slot counts without holding
+// all storage in memory.
+type accountMeta struct {
+	address  common.Address
+	addrHash common.Hash
+	nonce    uint64
+	balance  *uint256.Int
+	// Contract fields
+	isContract bool
+	numSlots   int   // Number of storage slots to generate
+	codeSize   int   // Code size to generate
+	codeSeed   int64 // Seed for reproducible code/storage generation
+	// Genesis account fields (pre-defined data)
+	genesisAccount *types.StateAccount
+	genesisStorage map[common.Hash]common.Hash
+	genesisCode    []byte
+	genesisCH      common.Hash // pre-computed code hash for genesis
+}
+
+// generateAccountMetas creates lightweight metadata for all accounts.
+// Storage is NOT generated here — only slot counts are recorded.
+func (g *Generator) generateAccountMetas(stats *Stats) ([]*accountMeta, error) {
+	totalAccounts := g.config.NumAccounts + g.config.NumContracts + len(g.config.GenesisAccounts)
+	metas := make([]*accountMeta, 0, totalAccounts)
+
+	usedAddresses := make(map[common.Address]bool)
+	genesisEOAs, genesisContracts := 0, 0
+
+	// Genesis accounts
+	for addr, acc := range g.config.GenesisAccounts {
+		usedAddresses[addr] = true
+
+		meta := &accountMeta{
+			address:        addr,
+			addrHash:       crypto.Keccak256Hash(addr[:]),
+			genesisAccount: acc,
+		}
+
+		if storage, ok := g.config.GenesisStorage[addr]; ok {
+			meta.genesisStorage = storage
+			meta.isContract = true
+			stats.StorageSlotsCreated += len(storage)
+		}
+
+		if code, ok := g.config.GenesisCode[addr]; ok {
+			meta.genesisCode = code
+			meta.genesisCH = crypto.Keccak256Hash(code)
+			meta.isContract = true
+		}
+
+		if meta.isContract {
+			genesisContracts++
+		} else {
+			genesisEOAs++
+		}
+
+		metas = append(metas, meta)
+	}
+
+	if g.config.Verbose && len(g.config.GenesisAccounts) > 0 {
+		log.Printf("Included %d genesis alloc accounts (%d EOAs, %d contracts)",
+			len(g.config.GenesisAccounts), genesisEOAs, genesisContracts)
+	}
+
+	// Update live stats
+	if g.config.LiveStats != nil {
+		g.config.LiveStats.SetPhase("accounts")
+	}
+
+	// Generate EOA metadata
+	for i := 0; i < g.config.NumAccounts; i++ {
+		var addr common.Address
+		g.rng.Read(addr[:])
+		for usedAddresses[addr] {
+			g.rng.Read(addr[:])
+		}
+		usedAddresses[addr] = true
+
+		metas = append(metas, &accountMeta{
+			address:    addr,
+			addrHash:   crypto.Keccak256Hash(addr[:]),
+			nonce:      uint64(g.rng.Intn(1000)),
+			balance:    new(uint256.Int).Mul(uint256.NewInt(uint64(g.rng.Intn(1000))), uint256.NewInt(1e18)),
+			isContract: false,
+		})
+
+		if g.config.LiveStats != nil {
+			g.config.LiveStats.AddAccount()
+		}
+	}
+	stats.AccountsCreated = genesisEOAs + g.config.NumAccounts
+
+	// Update live stats
+	if g.config.LiveStats != nil {
+		g.config.LiveStats.SetPhase("contracts")
+	}
+
+	// Generate contract metadata (slot counts only)
+	slotDistribution := g.generateSlotDistribution()
+
+	for i := 0; i < g.config.NumContracts; i++ {
+		var addr common.Address
+		g.rng.Read(addr[:])
+		for usedAddresses[addr] {
+			g.rng.Read(addr[:])
+		}
+		usedAddresses[addr] = true
+
+		numSlots := slotDistribution[i]
+		stats.StorageSlotsCreated += numSlots
+
+		metas = append(metas, &accountMeta{
+			address:    addr,
+			addrHash:   crypto.Keccak256Hash(addr[:]),
+			nonce:      uint64(g.rng.Intn(1000)),
+			balance:    new(uint256.Int).Mul(uint256.NewInt(uint64(g.rng.Intn(100))), uint256.NewInt(1e18)),
+			isContract: true,
+			numSlots:   numSlots,
+			codeSize:   g.config.CodeSize + g.rng.Intn(g.config.CodeSize),
+			codeSeed:   g.rng.Int63(),
+		})
+
+		if g.config.LiveStats != nil {
+			g.config.LiveStats.AddContract(numSlots)
+		}
+	}
+	stats.ContractsCreated = genesisContracts + g.config.NumContracts
+
+	if g.config.Verbose {
+		log.Printf("Generated metadata for %d accounts, %d contracts with %d total storage slots",
+			stats.AccountsCreated, stats.ContractsCreated, stats.StorageSlotsCreated)
+	}
+
+	// Sort by address hash for deterministic StackTrie construction
+	sort.Slice(metas, func(i, j int) bool {
+		return bytes.Compare(metas[i].addrHash[:], metas[j].addrHash[:]) < 0
+	})
+
+	return metas, nil
+}
+
+// streamWriteStateMPT processes accounts one at a time in streaming fashion.
+// For each account: generate storage → compute storage root → write to DB → discard.
+// This keeps memory bounded by the largest single contract's storage.
+func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) error {
+	accountTrie := trie.NewStackTrie(nil)
+
+	processedCount := 0
+	totalCount := len(metas)
+	var lastLogTime = time.Now()
+
+	for _, meta := range metas {
+		var stateAccount types.StateAccount
+		var code []byte
+		var codeHash common.Hash
+		var storageSlots []storageSlot
+
+		if meta.genesisAccount != nil {
+			// Genesis account
+			stateAccount = *meta.genesisAccount
+			code = meta.genesisCode
+			codeHash = meta.genesisCH
+			if meta.genesisStorage != nil {
+				storageSlots = mapToSortedSlots(meta.genesisStorage)
+			}
+		} else if meta.isContract {
+			// Generated contract: create code and storage from seed
+			rng := mrand.New(mrand.NewSource(meta.codeSeed))
+			code = make([]byte, meta.codeSize)
+			rng.Read(code)
+			codeHash = crypto.Keccak256Hash(code)
+
+			// Generate storage slots
+			storageSlots = make([]storageSlot, 0, meta.numSlots)
+			for j := 0; j < meta.numSlots; j++ {
+				var key, value common.Hash
+				rng.Read(key[:])
+				rng.Read(value[:])
+				if value == (common.Hash{}) {
+					value[31] = 1
+				}
+				storageSlots = append(storageSlots, storageSlot{Key: key, Value: value})
+			}
+			sort.Slice(storageSlots, func(i, j int) bool {
+				return bytes.Compare(storageSlots[i].Key[:], storageSlots[j].Key[:]) < 0
+			})
+
+			stateAccount = types.StateAccount{
+				Nonce:    meta.nonce,
+				Balance:  meta.balance,
+				Root:     types.EmptyRootHash,
+				CodeHash: codeHash.Bytes(),
+			}
+		} else {
+			// EOA
+			stateAccount = types.StateAccount{
+				Nonce:    meta.nonce,
+				Balance:  meta.balance,
+				Root:     types.EmptyRootHash,
+				CodeHash: types.EmptyCodeHash.Bytes(),
+			}
+		}
+
+		// Compute storage root and write storage via StateWriter
+		if len(storageSlots) > 0 {
+			storageTrie := trie.NewStackTrie(nil)
+
+			// MPT requires keys sorted by Keccak256(key)
+			type keyWithHash struct {
+				slot    storageSlot
+				keyHash common.Hash
+			}
+			withHashes := make([]keyWithHash, len(storageSlots))
+			for i, slot := range storageSlots {
+				withHashes[i] = keyWithHash{
+					slot:    slot,
+					keyHash: crypto.Keccak256Hash(slot.Key[:]),
+				}
+			}
+			sort.Slice(withHashes, func(i, j int) bool {
+				return bytes.Compare(withHashes[i].keyHash[:], withHashes[j].keyHash[:]) < 0
+			})
+
+			for _, kh := range withHashes {
+				if err := g.writer.WriteStorage(meta.address, 0, kh.slot.Key, kh.slot.Value); err != nil {
+					return fmt.Errorf("write storage: %w", err)
+				}
+
+				valueRLP, err := encodeStorageValue(kh.slot.Value)
+				if err != nil {
+					return err
+				}
+				storageTrie.Update(kh.keyHash[:], valueRLP)
+			}
+
+			stateAccount.Root = storageTrie.Hash()
+		}
+
+		// Write code
+		if len(code) > 0 {
+			if err := g.writer.WriteCode(codeHash, code); err != nil {
+				return fmt.Errorf("write code: %w", err)
+			}
+		}
+
+		// Write account
+		if err := g.writer.WriteAccount(meta.address, &stateAccount, 0); err != nil {
+			return fmt.Errorf("write account: %w", err)
+		}
+
+		// Add to account trie
+		slimData := types.SlimAccountRLP(stateAccount)
+		accountTrie.Update(meta.addrHash[:], slimData)
+
+		// Collect sample addresses
+		if meta.isContract {
+			if len(stats.SampleContracts) < 3 {
+				stats.SampleContracts = append(stats.SampleContracts, meta.address)
+			}
+		} else {
+			if len(stats.SampleEOAs) < 3 {
+				stats.SampleEOAs = append(stats.SampleEOAs, meta.address)
+			}
+		}
+
+		processedCount++
+
+		// Progress logging
+		if g.config.Verbose && time.Since(lastLogTime) > 20*time.Second {
+			lastLogTime = time.Now()
+			pct := float64(processedCount) / float64(totalCount) * 100
+			log.Printf("[MPT] %d/%d accounts (%.1f%%)", processedCount, totalCount, pct)
+		}
+
+		// Sync live stats
+		if g.config.LiveStats != nil && processedCount%1000 == 0 {
+			g.config.LiveStats.SyncBytes(g.writer.Stats())
+		}
+	}
+
+	// Flush all pending writes
+	if err := g.writer.Flush(); err != nil {
+		return fmt.Errorf("flush writes: %w", err)
+	}
+
+	// Compute and store state root
+	stateRoot := accountTrie.Hash()
+	stats.StateRoot = stateRoot
+
+	if err := g.writer.SetStateRoot(stateRoot); err != nil {
+		return fmt.Errorf("failed to write state root: %w", err)
+	}
+
+	if g.config.Verbose {
+		log.Printf("State root: %s", stateRoot.Hex())
+	}
+
+	writerStats := g.writer.Stats()
+	stats.AccountBytes = writerStats.AccountBytes
+	stats.StorageBytes = writerStats.StorageBytes
+	stats.CodeBytes = writerStats.CodeBytes
+
+	return nil
 }
 
 // generateStreamingBinary generates state for binary trie mode using a
