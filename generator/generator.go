@@ -324,6 +324,10 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		stats.AccountsCreated++
 		if g.config.LiveStats != nil {
 			g.config.LiveStats.AddAccount()
+			// Sync byte stats every 1000 accounts
+			if stats.AccountsCreated%1000 == 0 {
+				g.config.LiveStats.SyncBytes(g.writer.Stats())
+			}
 		}
 		if len(stats.SampleEOAs) < 3 {
 			stats.SampleEOAs = append(stats.SampleEOAs, acc.address)
@@ -374,6 +378,10 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		stats.StorageSlotsCreated += len(contract.storage)
 		if g.config.LiveStats != nil {
 			g.config.LiveStats.AddContract(len(contract.storage))
+			// Sync byte stats every 100 contracts
+			if stats.ContractsCreated%100 == 0 {
+				g.config.LiveStats.SyncBytes(g.writer.Stats())
+			}
 		}
 		if len(stats.SampleContracts) < 3 {
 			stats.SampleContracts = append(stats.SampleContracts, contract.address)

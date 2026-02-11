@@ -185,6 +185,17 @@ func (ls *LiveStats) AddBytes(account, storage, code int64) {
 	ls.TotalBytes = ls.AccountBytes + ls.StorageBytes + ls.CodeBytes
 }
 
+// SyncBytes updates byte counts from a WriterStats snapshot.
+// This replaces the byte counts rather than adding to them.
+func (ls *LiveStats) SyncBytes(ws WriterStats) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	ls.AccountBytes = int64(ws.AccountBytes)
+	ls.StorageBytes = int64(ws.StorageBytes)
+	ls.CodeBytes = int64(ws.CodeBytes)
+	ls.TotalBytes = ls.AccountBytes + ls.StorageBytes + ls.CodeBytes
+}
+
 func (ls *LiveStats) SetStateRoot(root string) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
