@@ -39,6 +39,15 @@ type LiveStats struct {
 
 	// Distribution histogram (slots per contract)
 	SlotHistogram []int `json:"slotHistogram"` // buckets: 0-10, 10-100, 100-1K, 1K-10K, 10K+
+
+	// Treemap data - top contracts by slot count
+	TreemapData []TreemapNode `json:"treemapData"`
+}
+
+// TreemapNode represents a contract in the treemap
+type TreemapNode struct {
+	ID    int `json:"id"`
+	Slots int `json:"slots"`
 }
 
 // StatsServer provides an HTTP endpoint for live stats.
@@ -156,6 +165,15 @@ func (ls *LiveStats) AddContract(slots int) {
 	default:
 		ls.SlotHistogram[4]++
 	}
+
+	// Update treemap data - keep last 200 contracts as rolling sample
+	ls.TreemapData = append(ls.TreemapData, TreemapNode{
+		ID:    ls.ContractsCreated,
+		Slots: slots,
+	})
+	if len(ls.TreemapData) > 200 {
+		ls.TreemapData = ls.TreemapData[len(ls.TreemapData)-200:]
+	}
 }
 
 func (ls *LiveStats) AddBytes(account, storage, code int64) {
@@ -181,173 +199,171 @@ const dashboardHTML = `<!DOCTYPE html>
     <title>state-actor monitor</title>
     <style>
         :root {
-            --bg: #0c0c0c;
-            --surface: #141414;
-            --border: #252525;
-            --text: #888;
-            --text-hi: #ccc;
+            --bg: #0a0a0c;
+            --surface: #131318;
+            --border: #1e1e26;
+            --text: #666;
+            --text-hi: #999;
             --accent: #00d4aa;
+            --accent2: #00a888;
             --orange: #e89b50;
             --purple: #a78bfa;
-            --red: #f87171;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'SF Mono', 'Consolas', monospace;
-            font-size: 12px;
+            font-size: 11px;
             background: var(--bg);
             color: var(--text);
             padding: 1rem;
             min-height: 100vh;
         }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        .card {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            padding: 1rem;
-        }
-        .card.wide { grid-column: span 2; }
-        .card-title {
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--text);
-            margin-bottom: 0.75rem;
-        }
-        .big-num {
-            font-size: 28px;
-            font-weight: 600;
-            color: var(--accent);
-            line-height: 1;
-        }
-        .big-num.orange { color: var(--orange); }
-        .big-num.purple { color: var(--purple); }
-        .unit {
-            font-size: 11px;
-            color: var(--text);
-            margin-left: 4px;
-        }
-        .sub {
-            font-size: 11px;
-            color: var(--text);
-            margin-top: 4px;
-        }
-        .progress-bar {
-            height: 4px;
-            background: var(--border);
-            border-radius: 2px;
-            margin-top: 0.75rem;
-            overflow: hidden;
-        }
-        .progress-fill {
-            height: 100%;
-            background: var(--accent);
-            transition: width 0.3s;
-        }
-        .bar-chart {
-            display: flex;
-            align-items: flex-end;
-            gap: 4px;
-            height: 60px;
-            margin-top: 0.5rem;
-        }
-        .bar {
-            flex: 1;
-            background: var(--accent);
-            border-radius: 2px 2px 0 0;
-            min-height: 2px;
-            opacity: 0.8;
-        }
-        .bar-labels {
-            display: flex;
-            gap: 4px;
-            margin-top: 4px;
-            font-size: 9px;
-            color: var(--text);
-        }
-        .bar-labels span { flex: 1; text-align: center; }
-        .status {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 3px;
-            font-size: 10px;
-            text-transform: uppercase;
-        }
-        .status.running { background: rgba(0,212,170,0.2); color: var(--accent); }
-        .status.done { background: rgba(168,139,250,0.2); color: var(--purple); }
-        .status.init { background: rgba(136,136,136,0.2); color: var(--text); }
-        .bytes-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 0.5rem;
-            margin-top: 0.5rem;
-        }
-        .bytes-item {
-            text-align: center;
-            padding: 0.5rem;
-            background: var(--bg);
-            border-radius: 3px;
-        }
-        .bytes-val {
-            font-size: 14px;
-            color: var(--text-hi);
-        }
-        .bytes-label {
-            font-size: 9px;
-            color: var(--text);
-            margin-top: 2px;
-        }
+        .container { max-width: 1400px; margin: 0 auto; }
         .header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 1rem;
-            padding-bottom: 1rem;
+            padding-bottom: 0.75rem;
             border-bottom: 1px solid var(--border);
-            max-width: 1200px;
-            margin-left: auto;
-            margin-right: auto;
         }
-        .header h1 {
-            font-size: 14px;
+        .header h1 { font-size: 13px; font-weight: 600; color: var(--accent); }
+        .config-line { font-size: 10px; color: var(--text); }
+        .config-line span { color: var(--orange); }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(6, 1fr);
+            gap: 0.75rem;
+        }
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 0.75rem;
+        }
+        .card.span2 { grid-column: span 2; }
+        .card.span3 { grid-column: span 3; }
+        .card.span4 { grid-column: span 4; }
+        .card.span6 { grid-column: span 6; }
+        .card-title {
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text);
+            margin-bottom: 0.5rem;
+        }
+        .metric {
+            font-size: 22px;
             font-weight: 600;
             color: var(--accent);
+            line-height: 1;
         }
-        .config-line {
-            font-size: 11px;
-            color: var(--text);
+        .metric.orange { color: var(--orange); }
+        .metric.purple { color: var(--purple); }
+        .metric .unit { font-size: 10px; color: var(--text); margin-left: 2px; }
+        .sub { font-size: 10px; color: var(--text); margin-top: 3px; }
+        
+        .progress {
+            height: 3px;
+            background: var(--border);
+            border-radius: 2px;
+            margin-top: 0.5rem;
+            overflow: hidden;
         }
-        .config-line span { color: var(--orange); }
-        .root {
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent2), var(--accent));
+            transition: width 0.3s;
+        }
+        
+        .status {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 9px;
+            text-transform: uppercase;
+            font-weight: 500;
+        }
+        .status.running { background: rgba(0,212,170,0.15); color: var(--accent); }
+        .status.done { background: rgba(167,139,250,0.15); color: var(--purple); }
+        .status.init { background: rgba(102,102,102,0.15); color: var(--text); }
+        
+        .bar-chart {
+            display: flex;
+            align-items: flex-end;
+            gap: 3px;
+            height: 50px;
+        }
+        .bar {
+            flex: 1;
+            background: linear-gradient(180deg, var(--accent), var(--accent2));
+            border-radius: 2px 2px 0 0;
+            min-height: 2px;
+        }
+        .bar-labels {
+            display: flex;
+            gap: 3px;
+            margin-top: 3px;
+            font-size: 8px;
+        }
+        .bar-labels span { flex: 1; text-align: center; }
+        
+        .treemap {
+            width: 100%;
+            height: 180px;
+            position: relative;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .treemap-rect {
+            position: absolute;
+            box-sizing: border-box;
+            border: 1px solid var(--bg);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 8px;
+            color: rgba(0,0,0,0.6);
+            overflow: hidden;
+            transition: all 0.2s;
+        }
+        .treemap-rect:hover {
+            border-color: #fff;
+            z-index: 10;
+        }
+        
+        .root-hash {
             font-family: monospace;
-            font-size: 11px;
+            font-size: 10px;
             color: var(--purple);
             word-break: break-all;
+            background: var(--bg);
+            padding: 0.5rem;
+            border-radius: 3px;
             margin-top: 0.5rem;
         }
-        .no-data {
-            color: var(--text);
-            text-align: center;
-            padding: 2rem;
+
+        @media (max-width: 900px) {
+            .grid { grid-template-columns: repeat(2, 1fr); }
+            .card.span2, .card.span3, .card.span4, .card.span6 { grid-column: span 2; }
         }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>state-actor</h1>
-        <div class="config-line" id="config">waiting for data...</div>
-    </div>
-    <div class="grid" id="dashboard">
-        <div class="no-data">connecting...</div>
+    <div class="container">
+        <div class="header">
+            <h1>state-actor</h1>
+            <div class="config-line" id="config">waiting...</div>
+        </div>
+        <div class="grid" id="dashboard"></div>
     </div>
     <script>
+        const colors = [
+            '#00d4aa', '#00c49a', '#00b48a', '#00a47a', '#00946a',
+            '#00845a', '#00744a', '#00643a', '#00542a', '#00441a'
+        ];
+        
         function fmt(n) {
             if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
             if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
@@ -355,87 +371,158 @@ const dashboardHTML = `<!DOCTYPE html>
             return n.toString();
         }
         function fmtBytes(b) {
-            if (b >= 1e9) return (b/1e9).toFixed(2) + ' GB';
-            if (b >= 1e6) return (b/1e6).toFixed(2) + ' MB';
-            if (b >= 1e3) return (b/1e3).toFixed(2) + ' KB';
-            return b + ' B';
+            if (b >= 1e9) return (b/1e9).toFixed(1) + 'GB';
+            if (b >= 1e6) return (b/1e6).toFixed(1) + 'MB';
+            if (b >= 1e3) return (b/1e3).toFixed(1) + 'KB';
+            return b + 'B';
         }
         function fmtTime(ms) {
             if (ms >= 60000) return (ms/60000).toFixed(1) + 'm';
             if (ms >= 1000) return (ms/1000).toFixed(1) + 's';
             return ms + 'ms';
         }
+        
+        function buildTreemap(data, width, height) {
+            if (!data || data.length === 0) return '<div style="color:var(--text);padding:1rem;text-align:center">generating...</div>';
+            
+            // Sort by slots descending, take top 100
+            const sorted = [...data].sort((a, b) => b.slots - a.slots).slice(0, 100);
+            const total = sorted.reduce((s, d) => s + d.slots, 0);
+            if (total === 0) return '';
+            
+            // Simple squarified treemap layout
+            let rects = [];
+            let x = 0, y = 0, w = width, h = height;
+            let remaining = [...sorted];
+            
+            while (remaining.length > 0) {
+                const isHoriz = w >= h;
+                const side = isHoriz ? h : w;
+                
+                // Find best row
+                let row = [];
+                let rowTotal = 0;
+                let best = Infinity;
+                
+                for (let i = 0; i < remaining.length; i++) {
+                    row.push(remaining[i]);
+                    rowTotal += remaining[i].slots;
+                    const rowFrac = rowTotal / total;
+                    const rowSize = rowFrac * (isHoriz ? w : h);
+                    
+                    let worst = 0;
+                    for (const r of row) {
+                        const frac = r.slots / rowTotal;
+                        const rw = isHoriz ? rowSize : frac * side;
+                        const rh = isHoriz ? frac * side : rowSize;
+                        const aspect = Math.max(rw/rh, rh/rw);
+                        worst = Math.max(worst, aspect);
+                    }
+                    
+                    if (worst > best) {
+                        row.pop();
+                        rowTotal -= remaining[i].slots;
+                        break;
+                    }
+                    best = worst;
+                }
+                
+                if (row.length === 0) row = [remaining[0]], rowTotal = remaining[0].slots;
+                
+                // Layout row
+                const rowFrac = rowTotal / total;
+                const rowSize = rowFrac * (isHoriz ? w : h);
+                let offset = 0;
+                
+                for (const r of row) {
+                    const frac = r.slots / rowTotal;
+                    const itemSize = frac * side;
+                    const colorIdx = Math.min(Math.floor(Math.log10(Math.max(r.slots, 1)) * 2), colors.length - 1);
+                    
+                    if (isHoriz) {
+                        rects.push({ x: x, y: y + offset, w: rowSize, h: itemSize, slots: r.slots, color: colors[colorIdx] });
+                    } else {
+                        rects.push({ x: x + offset, y: y, w: itemSize, h: rowSize, slots: r.slots, color: colors[colorIdx] });
+                    }
+                    offset += itemSize;
+                }
+                
+                // Update bounds
+                if (isHoriz) { x += rowSize; w -= rowSize; }
+                else { y += rowSize; h -= rowSize; }
+                
+                // Remove processed items
+                remaining = remaining.filter(r => !row.includes(r));
+                total - rowTotal;
+            }
+            
+            return rects.map(r => 
+                '<div class="treemap-rect" style="left:' + r.x + 'px;top:' + r.y + 'px;width:' + r.w + 'px;height:' + r.h + 'px;background:' + r.color + '" title="' + r.slots + ' slots">' + 
+                (r.w > 25 && r.h > 15 ? r.slots : '') + '</div>'
+            ).join('');
+        }
 
         function render(s) {
-            const pctAccounts = s.targetAccounts ? (s.accountsCreated / s.targetAccounts * 100) : 0;
-            const pctContracts = s.targetContracts ? (s.contractsCreated / s.targetContracts * 100) : 0;
+            const pctA = s.targetAccounts ? (s.accountsCreated / s.targetAccounts * 100) : 0;
+            const pctC = s.targetContracts ? (s.contractsCreated / s.targetContracts * 100) : 0;
             const statusClass = s.phase === 'done' ? 'done' : (s.phase === 'init' ? 'init' : 'running');
+            const maxHist = Math.max(...s.slotHistogram, 1);
+            const avgSlots = s.contractsCreated > 0 ? (s.storageSlotsCreated / s.contractsCreated).toFixed(1) : '0';
 
             document.getElementById('config').innerHTML = 
-                '<span>--seed</span> ' + s.seed + 
-                ' <span>--distribution</span> ' + s.distribution + 
-                ' <span>--output-format</span> ' + s.outputFormat;
+                '<span>seed</span> ' + s.seed + ' · <span>dist</span> ' + s.distribution + ' · <span>format</span> ' + s.outputFormat;
 
-            const maxHist = Math.max(...s.slotHistogram, 1);
-
-            document.getElementById('dashboard').innerHTML = ` + "`" + `
-                <div class="card">
-                    <div class="card-title">status</div>
-                    <span class="status ${statusClass}">${s.phase}</span>
-                    <div class="sub">${fmtTime(s.elapsedMs)} elapsed</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">throughput</div>
-                    <div class="big-num">${fmt(Math.round(s.throughput))}<span class="unit">slots/s</span></div>
-                </div>
-                <div class="card">
-                    <div class="card-title">accounts</div>
-                    <div class="big-num orange">${fmt(s.accountsCreated)}</div>
-                    <div class="sub">of ${fmt(s.targetAccounts)} target</div>
-                    <div class="progress-bar"><div class="progress-fill" style="width:${pctAccounts}%"></div></div>
-                </div>
-                <div class="card">
-                    <div class="card-title">contracts</div>
-                    <div class="big-num orange">${fmt(s.contractsCreated)}</div>
-                    <div class="sub">of ${fmt(s.targetContracts)} target</div>
-                    <div class="progress-bar"><div class="progress-fill" style="width:${pctContracts}%"></div></div>
-                </div>
-                <div class="card">
-                    <div class="card-title">storage slots</div>
-                    <div class="big-num purple">${fmt(s.storageSlotsCreated)}</div>
-                    <div class="sub">${(s.storageSlotsCreated / Math.max(s.contractsCreated, 1)).toFixed(1)} avg per contract</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">total size</div>
-                    <div class="big-num">${fmtBytes(s.totalBytes)}</div>
-                    <div class="bytes-grid">
-                        <div class="bytes-item"><div class="bytes-val">${fmtBytes(s.accountBytes)}</div><div class="bytes-label">accounts</div></div>
-                        <div class="bytes-item"><div class="bytes-val">${fmtBytes(s.storageBytes)}</div><div class="bytes-label">storage</div></div>
-                        <div class="bytes-item"><div class="bytes-val">${fmtBytes(s.codeBytes)}</div><div class="bytes-label">code</div></div>
-                    </div>
-                </div>
-                <div class="card wide">
-                    <div class="card-title">slot distribution (contracts by slot count)</div>
-                    <div class="bar-chart">
-                        ${s.slotHistogram.map(v => '<div class="bar" style="height:' + (v/maxHist*100) + '%"></div>').join('')}
-                    </div>
-                    <div class="bar-labels">
-                        <span>0-10</span><span>10-100</span><span>100-1K</span><span>1K-10K</span><span>10K+</span>
-                    </div>
-                </div>
-                ${s.stateRoot ? '<div class="card wide"><div class="card-title">state root</div><div class="root">' + s.stateRoot + '</div></div>' : ''}
-            ` + "`" + `;
+            document.getElementById('dashboard').innerHTML = 
+                '<div class="card">' +
+                    '<div class="card-title">status</div>' +
+                    '<span class="status ' + statusClass + '">' + s.phase + '</span>' +
+                    '<div class="sub">' + fmtTime(s.elapsedMs) + '</div>' +
+                '</div>' +
+                '<div class="card">' +
+                    '<div class="card-title">throughput</div>' +
+                    '<div class="metric">' + fmt(Math.round(s.throughput)) + '<span class="unit">slots/s</span></div>' +
+                '</div>' +
+                '<div class="card">' +
+                    '<div class="card-title">accounts</div>' +
+                    '<div class="metric orange">' + fmt(s.accountsCreated) + '</div>' +
+                    '<div class="sub">/ ' + fmt(s.targetAccounts) + '</div>' +
+                    '<div class="progress"><div class="progress-fill" style="width:' + pctA + '%"></div></div>' +
+                '</div>' +
+                '<div class="card">' +
+                    '<div class="card-title">contracts</div>' +
+                    '<div class="metric orange">' + fmt(s.contractsCreated) + '</div>' +
+                    '<div class="sub">/ ' + fmt(s.targetContracts) + '</div>' +
+                    '<div class="progress"><div class="progress-fill" style="width:' + pctC + '%"></div></div>' +
+                '</div>' +
+                '<div class="card">' +
+                    '<div class="card-title">slots</div>' +
+                    '<div class="metric purple">' + fmt(s.storageSlotsCreated) + '</div>' +
+                    '<div class="sub">' + avgSlots + ' avg/contract</div>' +
+                '</div>' +
+                '<div class="card">' +
+                    '<div class="card-title">size</div>' +
+                    '<div class="metric">' + fmtBytes(s.totalBytes) + '</div>' +
+                    '<div class="sub">acct ' + fmtBytes(s.accountBytes) + ' · stor ' + fmtBytes(s.storageBytes) + '</div>' +
+                '</div>' +
+                '<div class="card span3">' +
+                    '<div class="card-title">distribution histogram</div>' +
+                    '<div class="bar-chart">' +
+                        s.slotHistogram.map(v => '<div class="bar" style="height:' + (v/maxHist*100) + '%"></div>').join('') +
+                    '</div>' +
+                    '<div class="bar-labels"><span>0-10</span><span>10-100</span><span>100-1K</span><span>1K-10K</span><span>10K+</span></div>' +
+                '</div>' +
+                '<div class="card span3">' +
+                    '<div class="card-title">state treemap (recent contracts by slot count)</div>' +
+                    '<div class="treemap">' + buildTreemap(s.treemapData, 520, 180) + '</div>' +
+                '</div>' +
+                (s.stateRoot ? '<div class="card span6"><div class="card-title">state root</div><div class="root-hash">' + s.stateRoot + '</div></div>' : '');
         }
 
         function poll() {
-            fetch('/stats')
-                .then(r => r.json())
-                .then(render)
-                .catch(() => {});
+            fetch('/stats').then(r => r.json()).then(render).catch(() => {});
         }
-
         poll();
-        setInterval(poll, 500);
+        setInterval(poll, 400);
     </script>
 </body>
 </html>`

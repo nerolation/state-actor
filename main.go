@@ -18,10 +18,12 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -272,6 +274,16 @@ func main() {
 		for i, addr := range stats.SampleContracts {
 			fmt.Printf("  Contract #%d: %s\n", i+1, addr.Hex())
 		}
+	}
+
+	// Keep stats server running after completion if enabled
+	if statsServer != nil {
+		fmt.Printf("\n=== Stats server still running at http://localhost:%d ===\n", *statsPort)
+		fmt.Printf("Press Ctrl+C to exit...\n")
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		fmt.Println("\nShutting down...")
 	}
 }
 
