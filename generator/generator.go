@@ -773,6 +773,20 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 
 	// --- Phase 2: Stream sorted entries from temp DB → compute root hash ---
 
+	// Compact the temp DB to flatten LSM levels into a single sorted run.
+	// This makes the sequential iteration single-pass I/O instead of a
+	// multi-level merge, reducing per-key CPU overhead across billions of entries.
+	if g.config.Verbose {
+		log.Printf("Compacting temp DB (%d entries)...", entryCount)
+	}
+	compactStart := time.Now()
+	if err := tempDB.Compact(nil, nil); err != nil {
+		return nil, fmt.Errorf("failed to compact temp DB: %w", err)
+	}
+	if g.config.Verbose {
+		log.Printf("Temp DB compaction complete in %v", time.Since(compactStart).Round(time.Millisecond))
+	}
+
 	if g.config.Verbose {
 		log.Printf("Computing root from %d trie entries (streaming, O(depth) memory)...", entryCount)
 	}
