@@ -451,12 +451,18 @@ func (sb *streamingBuilder) finish() common.Hash {
 	return sb.stack[0]
 }
 
+// trieNodeStats holds byte/node counts from Phase 2 trie node writing.
+type trieNodeStats struct {
+	Nodes int
+	Bytes int64
+}
+
 // computeBinaryRootStreamingFromSlice is the slice-based variant used for
 // testing equivalence with the recursive approach. It feeds pre-sorted
 // entries directly into the streaming builder without needing a DB iterator.
-func computeBinaryRootStreamingFromSlice(entries []trieEntry, db ethdb.KeyValueStore) common.Hash {
+func computeBinaryRootStreamingFromSlice(entries []trieEntry, db ethdb.KeyValueStore) (common.Hash, trieNodeStats) {
 	if len(entries) == 0 {
-		return common.Hash{}
+		return common.Hash{}, trieNodeStats{}
 	}
 	sb := &streamingBuilder{}
 	if db != nil {
@@ -482,18 +488,20 @@ func computeBinaryRootStreamingFromSlice(entries []trieEntry, db ethdb.KeyValueS
 	}
 
 	root := sb.finish()
+	var tnStats trieNodeStats
 	if sb.w != nil {
 		sb.w.flush()
+		tnStats = trieNodeStats{Nodes: sb.w.nodes, Bytes: sb.w.bytes}
 		log.Printf("Wrote %d trie nodes (%d MB)", sb.w.nodes, sb.w.bytes/1024/1024)
 	}
-	return root
+	return root, tnStats
 }
 
 // computeBinaryRootStreaming computes the root hash by iterating sorted
 // trie entries in a single forward pass. The iterator must yield entries
 // sorted by key (32 bytes each: key[0:31]=stem, key[31]=suffix).
 // Values are 32 bytes. O(depth) ≈ 8 KB memory for the stack.
-func computeBinaryRootStreaming(iter ethdb.Iterator, db ethdb.KeyValueStore) common.Hash {
+func computeBinaryRootStreaming(iter ethdb.Iterator, db ethdb.KeyValueStore) (common.Hash, trieNodeStats) {
 	sb := &streamingBuilder{}
 	if db != nil {
 		sb.w = &trieNodeWriter{batch: db.NewBatch(), db: db}
@@ -529,10 +537,12 @@ func computeBinaryRootStreaming(iter ethdb.Iterator, db ethdb.KeyValueStore) com
 
 	root := sb.finish()
 
+	var tnStats trieNodeStats
 	if sb.w != nil {
 		sb.w.flush()
+		tnStats = trieNodeStats{Nodes: sb.w.nodes, Bytes: sb.w.bytes}
 		log.Printf("Wrote %d trie nodes (%d MB)", sb.w.nodes, sb.w.bytes/1024/1024)
 	}
 
-	return root
+	return root, tnStats
 }

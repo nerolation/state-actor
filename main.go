@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"math/big"
 	"os"
 	"os/signal"
@@ -123,6 +124,12 @@ func main() {
 		defer statsServer.Stop()
 	}
 
+	// When --target-size is set and --contracts was not explicitly provided,
+	// raise the contract cap so target-size becomes the governing constraint.
+	if parsedTargetSize > 0 && !isFlagSet("contracts") {
+		*contracts = math.MaxInt32
+	}
+
 	config := generator.Config{
 		DBPath:          *dbPath,
 		NumAccounts:     *accounts,
@@ -174,7 +181,11 @@ func main() {
 		log.Printf("  Database:     %s", config.DBPath)
 		log.Printf("  Output Format: %s", config.OutputFormat)
 		log.Printf("  Accounts:     %d", config.NumAccounts)
-		log.Printf("  Contracts:    %d", config.NumContracts)
+		if config.NumContracts >= math.MaxInt32 {
+			log.Printf("  Contracts:    unlimited (governed by --target-size)")
+		} else {
+			log.Printf("  Contracts:    %d", config.NumContracts)
+		}
 		log.Printf("  Max Slots:    %d", config.MaxSlots)
 		log.Printf("  Min Slots:    %d", config.MinSlots)
 		log.Printf("  Distribution: %s", *distribution)
@@ -239,6 +250,13 @@ func main() {
 	fmt.Printf("Contracts Created: %d\n", stats.ContractsCreated)
 	fmt.Printf("Storage Slots:     %d\n", stats.StorageSlotsCreated)
 	fmt.Printf("Total Bytes:       %s\n", formatBytes(stats.TotalBytes))
+	if stats.TrieNodeBytes > 0 {
+		fmt.Printf("Trie Node Bytes:   %s\n", formatBytes(stats.TrieNodeBytes))
+	}
+	// Report actual on-disk size (after Pebble compression).
+	if dbSize, err := dirSize(config.DBPath); err == nil {
+		fmt.Printf("Total DB Size:     %s\n", formatBytes(dbSize))
+	}
 	fmt.Printf("Throughput:        %.2f slots/sec\n", float64(stats.StorageSlotsCreated)/elapsed.Seconds())
 	fmt.Printf("State Root:        %s\n", stats.StateRoot.Hex())
 
@@ -336,4 +354,30 @@ func parseSize(s string) (uint64, error) {
 		return 0, fmt.Errorf("invalid size format %q (use e.g. '5GB', '500MB')", s)
 	}
 	return val, nil
+}
+
+// isFlagSet returns true if the named flag was explicitly set on the command line.
+func isFlagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+// dirSize returns the total size of all files in a directory tree.
+func dirSize(path string) (uint64, error) {
+	var total uint64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			total += uint64(info.Size())
+		}
+		return nil
+	})
+	return total, err
 }

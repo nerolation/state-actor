@@ -737,11 +737,13 @@ func TestTargetSizeStopsEarly(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "testdb")
 
-	// Generate without target-size to get a baseline entry count.
+	// Generate without target-size to get a baseline.
+	// Use enough contracts (5000) so that Pebble flushes data to disk,
+	// making dirSize() measurements meaningful for the target check.
 	configFull := Config{
 		DBPath:       dbPath,
 		NumAccounts:  20,
-		NumContracts: 50,
+		NumContracts: 5000,
 		MaxSlots:     100,
 		MinSlots:     10,
 		Distribution: PowerLaw,
@@ -762,19 +764,18 @@ func TestTargetSizeStopsEarly(t *testing.T) {
 	}
 	genFull.Close()
 
-	// Now generate with a target-size that's roughly 30% of full.
-	// Full run creates many contracts; a small target should stop early.
 	fullContracts := statsFull.ContractsCreated
-	if fullContracts < 10 {
+	if fullContracts < 100 {
 		t.Skipf("Full run only created %d contracts, not enough to test early stop", fullContracts)
 	}
 
 	dbPath2 := filepath.Join(tmpDir, "testdb2")
-	// Use a small target size (50KB) to ensure early stopping.
+	// Use a target size (~500KB) that should cause early stopping well
+	// before all 5000 contracts are generated.
 	configTarget := Config{
 		DBPath:       dbPath2,
 		NumAccounts:  20,
-		NumContracts: 50,
+		NumContracts: 5000,
 		MaxSlots:     100,
 		MinSlots:     10,
 		Distribution: PowerLaw,
@@ -783,7 +784,7 @@ func TestTargetSizeStopsEarly(t *testing.T) {
 		Workers:      1,
 		CodeSize:     256,
 		TrieMode:     TrieModeBinary,
-		TargetSize:   50 * 1024, // 50 KB target
+		TargetSize:   500 * 1024, // 500 KB target
 	}
 
 	genTarget, err := New(configTarget)
@@ -797,7 +798,7 @@ func TestTargetSizeStopsEarly(t *testing.T) {
 	genTarget.Close()
 
 	t.Logf("Full: %d contracts, %d slots", statsFull.ContractsCreated, statsFull.StorageSlotsCreated)
-	t.Logf("Target (50KB): %d contracts, %d slots", statsTarget.ContractsCreated, statsTarget.StorageSlotsCreated)
+	t.Logf("Target (500KB): %d contracts, %d slots", statsTarget.ContractsCreated, statsTarget.StorageSlotsCreated)
 
 	if statsTarget.ContractsCreated >= statsFull.ContractsCreated {
 		t.Errorf("Target-size should have stopped early: created %d contracts (full run: %d)",
