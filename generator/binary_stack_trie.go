@@ -119,29 +119,43 @@ func serializeStemNode(stem []byte, entries []trieEntry) []byte {
 //  1. Hash each value: data[suffix] = SHA256(value)
 //  2. 8-level tree reduction: data[i] = SHA256(data[2i] || data[2i+1]), skip if both zero
 //  3. Final: SHA256(stem || 0x00 || data[0])
+//
+// Uses a [4]uint64 bitmap to skip zero pairs in the tree reduction.
+// For a typical StemNode with k=2 entries, this reduces iterations from
+// 255 (with 32-byte comparisons) to ~16 (with single-bit tests).
 func computeStemNodeHash(stem []byte, entries []trieEntry) common.Hash {
 	var data [stemNodeWidth]common.Hash
-	var zeroHash common.Hash
+	var bm [4]uint64 // 256-bit bitmap: bit set = data[i] is non-zero
 
-	// Step 1: Hash each value at its suffix position
+	// Step 1: Hash each value at its suffix position, mark bitmap
 	for _, e := range entries {
 		suffix := e.Key[stemSize] // key[31]
 		data[suffix] = sha256.Sum256(e.Value[:])
+		bm[suffix/64] |= 1 << (63 - uint(suffix)%64)
 	}
 
-	// Step 2: 8-level tree reduction (matching StemNode.Hash exactly)
+	// Step 2: 8-level tree reduction — skip zero pairs via bitmap.
+	// The reduction is in-place (writes data[i] from data[2i],data[2i+1]),
+	// so we must explicitly zero data[i] when skipping to avoid stale values
+	// from Step 1 or previous levels.
 	var buf [64]byte
 	for level := 1; level <= 8; level++ {
 		count := stemNodeWidth / (1 << level)
+		var newBm [4]uint64
 		for i := 0; i < count; i++ {
-			if data[i*2] == zeroHash && data[i*2+1] == zeroHash {
-				data[i] = zeroHash
+			li, ri := i*2, i*2+1
+			lSet := bm[li/64]&(1<<(63-uint(li)%64)) != 0
+			rSet := bm[ri/64]&(1<<(63-uint(ri)%64)) != 0
+			if !lSet && !rSet {
+				data[i] = common.Hash{} // clear stale data from earlier levels
 				continue
 			}
-			copy(buf[:32], data[i*2][:])
-			copy(buf[32:], data[i*2+1][:])
+			copy(buf[:32], data[li][:])
+			copy(buf[32:], data[ri][:])
 			data[i] = sha256.Sum256(buf[:])
+			newBm[i/64] |= 1 << (63 - uint(i)%64)
 		}
+		bm = newBm
 	}
 
 	// Step 3: Final hash = SHA256(stem || 0x00 || data[0])
