@@ -36,6 +36,12 @@ Thumbs.db
 chaindata/
 /testdata/chaindata/
 *.db/
+test-*-chaindata/
+test-small-geth/
+
+# Local go-ethereum clones and built geth binaries
+go-ethereum-fork/
+geth-fork
 
 # Temporary files
 tmp/
