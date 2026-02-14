@@ -91,6 +91,10 @@ example:
 	@echo "Example database created at /tmp/example-chaindata"
 	@du -sh /tmp/example-chaindata
 
+## reth-import: Build the reth-import Rust binary
+reth-import:
+	cd reth-import && cargo build --release
+
 ## help: Show this help
 help:
 	@echo "State Actor - Ethereum State Generator"

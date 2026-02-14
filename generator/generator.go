@@ -69,6 +69,22 @@ func New(config Config) (*Generator, error) {
 			return nil, fmt.Errorf("failed to create erigon writer: %w", err)
 		}
 
+	case OutputReth:
+		// For Reth, we still need a Pebble DB for binary trie temp storage
+		if config.TrieMode == TrieModeBinary || config.WriteTrieNodes {
+			db, err = pebble.New(config.DBPath+".geth-temp", 512, 256, "stategen/", false)
+			if err != nil {
+				return nil, fmt.Errorf("failed to open temp database: %w", err)
+			}
+		}
+		writer, err = NewRethStreamWriter(config.DBPath, config.GenesisJSON, config.RethImportBin)
+		if err != nil {
+			if db != nil {
+				db.Close()
+			}
+			return nil, fmt.Errorf("failed to create reth writer: %w", err)
+		}
+
 	case OutputGeth:
 		fallthrough
 	default:
@@ -99,8 +115,8 @@ func (g *Generator) Close() error {
 		}
 	}
 
-	// For Erigon format, db may be a separate temp DB
-	if g.db != nil && g.config.OutputFormat == OutputErigon {
+	// For Erigon/Reth format, db may be a separate temp DB
+	if g.db != nil && (g.config.OutputFormat == OutputErigon || g.config.OutputFormat == OutputReth) {
 		if err := g.db.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close temp db: %w", err))
 		}
