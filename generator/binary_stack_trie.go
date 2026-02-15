@@ -119,29 +119,43 @@ func serializeStemNode(stem []byte, entries []trieEntry) []byte {
 //  1. Hash each value: data[suffix] = SHA256(value)
 //  2. 8-level tree reduction: data[i] = SHA256(data[2i] || data[2i+1]), skip if both zero
 //  3. Final: SHA256(stem || 0x00 || data[0])
+//
+// Uses a [4]uint64 bitmap to skip zero pairs in the tree reduction.
+// For a typical StemNode with k=2 entries, this reduces iterations from
+// 255 (with 32-byte comparisons) to ~16 (with single-bit tests).
 func computeStemNodeHash(stem []byte, entries []trieEntry) common.Hash {
 	var data [stemNodeWidth]common.Hash
-	var zeroHash common.Hash
+	var bm [4]uint64 // 256-bit bitmap: bit set = data[i] is non-zero
 
-	// Step 1: Hash each value at its suffix position
+	// Step 1: Hash each value at its suffix position, mark bitmap
 	for _, e := range entries {
 		suffix := e.Key[stemSize] // key[31]
 		data[suffix] = sha256.Sum256(e.Value[:])
+		bm[suffix/64] |= 1 << (63 - uint(suffix)%64)
 	}
 
-	// Step 2: 8-level tree reduction (matching StemNode.Hash exactly)
+	// Step 2: 8-level tree reduction — skip zero pairs via bitmap.
+	// The reduction is in-place (writes data[i] from data[2i],data[2i+1]),
+	// so we must explicitly zero data[i] when skipping to avoid stale values
+	// from Step 1 or previous levels.
 	var buf [64]byte
 	for level := 1; level <= 8; level++ {
 		count := stemNodeWidth / (1 << level)
+		var newBm [4]uint64
 		for i := 0; i < count; i++ {
-			if data[i*2] == zeroHash && data[i*2+1] == zeroHash {
-				data[i] = zeroHash
+			li, ri := i*2, i*2+1
+			lSet := bm[li/64]&(1<<(63-uint(li)%64)) != 0
+			rSet := bm[ri/64]&(1<<(63-uint(ri)%64)) != 0
+			if !lSet && !rSet {
+				data[i] = common.Hash{} // clear stale data from earlier levels
 				continue
 			}
-			copy(buf[:32], data[i*2][:])
-			copy(buf[32:], data[i*2+1][:])
+			copy(buf[:32], data[li][:])
+			copy(buf[32:], data[ri][:])
 			data[i] = sha256.Sum256(buf[:])
+			newBm[i/64] |= 1 << (63 - uint(i)%64)
 		}
+		bm = newBm
 	}
 
 	// Step 3: Final hash = SHA256(stem || 0x00 || data[0])
@@ -288,6 +302,7 @@ type streamingBuilder struct {
 	isRight  [maxDepth]bool             // true if stack[d] is a right child
 	stemBits [maxDepth][stemSize]byte   // stem that placed each pending hash
 	w        *trieNodeWriter            // optional: writes serialized nodes to DB
+	pathBuf  [maxDepth]byte             // reusable buffer for buildPath
 
 	// Deferred stem: waiting for right-neighbor CPL before placement.
 	hasPrev     bool
@@ -295,6 +310,16 @@ type streamingBuilder struct {
 	prevStem    [stemSize]byte
 	prevLeftCPL int         // CPL with left neighbor (-1 if first stem)
 	prevEntries []trieEntry // kept only when w != nil (for serialization)
+}
+
+// buildPath writes the bit-path from root to `depth` into sb.pathBuf and
+// returns a sub-slice. The returned slice is only valid until the next
+// buildPath call. Safe because Pebble batch.Put() copies key/value internally.
+func (sb *streamingBuilder) buildPath(stem []byte, depth int) []byte {
+	for i := 0; i < depth; i++ {
+		sb.pathBuf[i] = stemBitAt(stem, i)
+	}
+	return sb.pathBuf[:depth]
 }
 
 // stemBitAt returns the bit value (0 or 1) at the given depth in a stem.
@@ -348,7 +373,7 @@ func (sb *streamingBuilder) flushDeferred(rightCPL int) {
 
 	// Write the StemNode — path derived from the stem being placed.
 	if sb.w != nil {
-		sb.w.writeNode(makePath(sb.prevStem[:], targetDepth), serializeStemNode(sb.prevStem[:], sb.prevEntries))
+		sb.w.writeNode(sb.buildPath(sb.prevStem[:], targetDepth), serializeStemNode(sb.prevStem[:], sb.prevEntries))
 	}
 
 	sb.propagateUp(sb.prevHash, targetDepth, sb.prevStem[:])
@@ -376,7 +401,7 @@ func (sb *streamingBuilder) unwindTo(minDepth int) {
 
 		if sb.w != nil {
 			// Path derived from the stem that placed this pending hash.
-			sb.w.writeNode(makePath(sb.stemBits[d][:], d), serializeInternalNode(left, right))
+			sb.w.writeNode(sb.buildPath(sb.stemBits[d][:], d), serializeInternalNode(left, right))
 		}
 		// Propagate upward using the stem that originally placed this hash.
 		stem := sb.stemBits[d]
@@ -412,7 +437,7 @@ func (sb *streamingBuilder) propagateUp(hash common.Hash, fromDepth int, stem []
 
 			if sb.w != nil {
 				// Path derived from stem — both children share bits 0..pd-1.
-				sb.w.writeNode(makePath(stem, pd), serializeInternalNode(left, right))
+				sb.w.writeNode(sb.buildPath(stem, pd), serializeInternalNode(left, right))
 			}
 			sb.occupied[pd] = false
 		} else if bit == 1 {
@@ -425,7 +450,7 @@ func (sb *streamingBuilder) propagateUp(hash common.Hash, fromDepth int, stem []
 			hash = sha256.Sum256(buf[:])
 
 			if sb.w != nil {
-				sb.w.writeNode(makePath(stem, pd), serializeInternalNode(common.Hash{}, right))
+				sb.w.writeNode(sb.buildPath(stem, pd), serializeInternalNode(common.Hash{}, right))
 			}
 			// Continue propagating upward — don't store.
 		} else {

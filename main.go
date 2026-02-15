@@ -124,10 +124,33 @@ func main() {
 		defer statsServer.Stop()
 	}
 
-	// When --target-size is set and --contracts was not explicitly provided,
-	// raise the contract cap so target-size becomes the governing constraint.
-	if parsedTargetSize > 0 && !isFlagSet("contracts") {
+	// When --target-size is set, auto-scale parameters so the user's
+	// --contracts value fills the target. The contract cap is raised to
+	// MaxInt32 as a safety net (dirSize() is the real stopping condition).
+	if parsedTargetSize > 0 {
+		userContracts := *contracts
 		*contracts = math.MaxInt32
+
+		// Auto-scale min-slots so that userContracts contracts produce
+		// enough trie entries to fill the target. Each contract has
+		// ~overhead fixed entries (header + code chunks) plus storage
+		// slots. Power-law average slots ≈ 3 × min_slots.
+		if !isFlagSet("min-slots") {
+			const bytesPerEntry uint64 = 80 // empirical after Pebble compression
+			numC := uint64(userContracts)
+			overhead := uint64(5 + (*codeSize+30)/31) // header fields + code chunks
+			targetEntries := parsedTargetSize / bytesPerEntry
+			entriesPerContract := targetEntries / numC
+			if entriesPerContract > overhead {
+				autoMin := int((entriesPerContract - overhead) / 3)
+				if autoMin > *minSlots {
+					*minSlots = autoMin
+				}
+			}
+		}
+		if !isFlagSet("max-slots") && *maxSlots < *minSlots*10 {
+			*maxSlots = *minSlots * 10
+		}
 	}
 
 	config := generator.Config{
@@ -186,8 +209,16 @@ func main() {
 		} else {
 			log.Printf("  Contracts:    %d", config.NumContracts)
 		}
-		log.Printf("  Max Slots:    %d", config.MaxSlots)
-		log.Printf("  Min Slots:    %d", config.MinSlots)
+		if parsedTargetSize > 0 && !isFlagSet("max-slots") {
+			log.Printf("  Max Slots:    %d (auto-scaled for target size)", config.MaxSlots)
+		} else {
+			log.Printf("  Max Slots:    %d", config.MaxSlots)
+		}
+		if parsedTargetSize > 0 && !isFlagSet("min-slots") {
+			log.Printf("  Min Slots:    %d (auto-scaled for target size)", config.MinSlots)
+		} else {
+			log.Printf("  Min Slots:    %d", config.MinSlots)
+		}
 		log.Printf("  Distribution: %s", *distribution)
 		log.Printf("  Seed:         %d", config.Seed)
 		log.Printf("  Batch Size:   %d", config.BatchSize)
