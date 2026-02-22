@@ -8,8 +8,10 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
+	"github.com/holiman/uint256"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
 )
 
@@ -528,6 +530,49 @@ func TestParallelKeyDerivation(t *testing.T) {
 			t.Errorf("entry %d differs:\n  seq: key=%x val=%x\n  par: key=%x val=%x",
 				i, seqEntries[i].Key[:4], seqEntries[i].Value[:4],
 				parEntries[i].Key[:4], parEntries[i].Value[:4])
+		}
+	}
+}
+
+// TestCollectAccountEntriesParallelEquivalence verifies that
+// collectAccountEntriesParallel produces identical sorted entries
+// as the sequential collectAccountEntries.
+func TestCollectAccountEntriesParallelEquivalence(t *testing.T) {
+	addr := common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	codeHash := sha256.Sum256([]byte("test-code"))
+	code := bytes.Repeat([]byte{0xAB}, 500)
+
+	acc := &types.StateAccount{
+		Nonce:    42,
+		Balance:  uint256.NewInt(1e18),
+		Root:     types.EmptyRootHash,
+		CodeHash: codeHash[:],
+	}
+
+	slots := make([]storageSlot, 200)
+	for i := range slots {
+		slots[i].Key = sha256.Sum256([]byte{byte(i), byte(i >> 8)})
+		slots[i].Value = sha256.Sum256([]byte{byte(i), 0xCC})
+	}
+	sort.Slice(slots, func(i, j int) bool {
+		return bytes.Compare(slots[i].Key[:], slots[j].Key[:]) < 0
+	})
+
+	// Sequential
+	seqEntries := collectAccountEntries(addr, acc, len(code), code, slots, nil)
+	sort.Slice(seqEntries, func(i, j int) bool {
+		return bytes.Compare(seqEntries[i].Key[:], seqEntries[j].Key[:]) < 0
+	})
+
+	// Parallel
+	parEntries := collectAccountEntriesParallel(addr, acc, len(code), code, slots)
+
+	if len(seqEntries) != len(parEntries) {
+		t.Fatalf("entry count mismatch: seq=%d par=%d", len(seqEntries), len(parEntries))
+	}
+	for i := range seqEntries {
+		if seqEntries[i] != parEntries[i] {
+			t.Errorf("entry %d differs", i)
 		}
 	}
 }

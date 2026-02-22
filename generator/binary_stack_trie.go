@@ -733,3 +733,40 @@ func computeBinaryRootStreaming(iter ethdb.Iterator, db ethdb.KeyValueStore, gro
 	return root, tnStats
 }
 
+
+// parallelStorageThreshold is the minimum number of storage slots needed
+// to justify worker pool overhead for parallel key derivation.
+const parallelStorageThreshold = 64
+
+// collectAccountEntriesParallel is like collectAccountEntries but uses
+// parallel key derivation for storage slots when the count exceeds
+// parallelStorageThreshold. Returns entries sorted by key.
+func collectAccountEntriesParallel(
+	addr common.Address,
+	acc *types.StateAccount,
+	codeLen int,
+	code []byte,
+	storage []storageSlot,
+) []trieEntry {
+	// Collect non-storage entries sequentially (account header + code).
+	// These are fast (2 entries for header, ~codeLen/32 for code chunks).
+	var entries []trieEntry
+	entries = collectAccountEntries(addr, acc, codeLen, code, nil, entries)
+
+	// Collect storage entries in parallel if above threshold.
+	if len(storage) >= parallelStorageThreshold {
+		storageEntries := collectStorageEntriesParallel(addr, storage)
+		entries = append(entries, storageEntries...)
+	} else {
+		for i := range storage {
+			entries = collectStorageEntry(addr, storage[i], entries)
+		}
+	}
+
+	// Sort all entries by key for temp DB insertion order.
+	sort.Slice(entries, func(i, j int) bool {
+		return bytes.Compare(entries[i].Key[:], entries[j].Key[:]) < 0
+	})
+
+	return entries
+}
