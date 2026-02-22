@@ -2,12 +2,14 @@ package generator
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log"
 	"math"
 	mrand "math/rand"
 	"os"
+	"runtime"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -880,7 +882,19 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		nodeDB = g.db
 	}
 	iter := tempDB.NewIterator(nil, nil)
-	stateRoot, tnStats := computeBinaryRootStreaming(iter, nodeDB, g.config.GroupDepth)
+	numWorkers := runtime.GOMAXPROCS(0) - 2
+	if numWorkers < 2 {
+		numWorkers = 2
+	}
+	if g.config.Verbose {
+		log.Printf("Phase 2: using %d parallel workers", numWorkers)
+	}
+	stateRoot, tnStats, err := computeBinaryRootStreamingParallel(
+		context.Background(), iter, nodeDB, g.config.GroupDepth, numWorkers,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute binary root: %w", err)
+	}
 	if g.config.Verbose {
 		log.Printf("Computed binary trie root in %v", time.Since(hashStart).Round(time.Millisecond))
 	}

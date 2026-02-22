@@ -2,8 +2,10 @@ package generator
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"log"
 	"math/bits"
 	"runtime"
@@ -769,4 +771,240 @@ func collectAccountEntriesParallel(
 	})
 
 	return entries
+}
+
+
+// --- Parallel Phase 2 pipeline ---
+
+// stemWork is a unit of work sent from the reader to worker goroutines.
+type stemWork struct {
+	seqNum  uint64
+	stem    [stemSize]byte
+	entries []trieEntry // freshly allocated per stem, not shared
+}
+
+// stemResult is produced by a worker after hashing a stem.
+type stemResult struct {
+	seqNum  uint64
+	stem    [stemSize]byte
+	hash    common.Hash
+	entries []trieEntry // passed through for trie node serialization
+}
+
+// computeBinaryRootStreamingParallel is the parallel variant of
+// computeBinaryRootStreaming. It splits Phase 2 into a 4-stage pipeline:
+//
+//	Reader → N Workers → Resequencer → Builder
+//
+// The reader iterates the sorted temp DB and groups entries by stem.
+// Workers compute computeStemNodeHash in parallel (embarrassingly parallel).
+// The resequencer reorders results back to sorted order via sequence numbers.
+// The builder runs feedStem in sorted order and writes trie nodes.
+//
+// The streaming builder (feedStem) MUST receive stems in sorted key order.
+// The resequencer guarantees this by holding out-of-order results until the
+// next expected sequence number arrives.
+func computeBinaryRootStreamingParallel(
+	ctx context.Context,
+	iter ethdb.Iterator,
+	db ethdb.KeyValueStore,
+	groupDepth int,
+	numWorkers int,
+) (common.Hash, trieNodeStats, error) {
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	// Channels
+	const maxInFlight = 64
+	sem := make(chan struct{}, maxInFlight)           // bounds total in-flight stems
+	workCh := make(chan *stemWork, 2*numWorkers)      // reader -> workers
+	resultCh := make(chan *stemResult, 2*numWorkers)  // workers -> resequencer
+	builderCh := make(chan *stemResult, 128)           // resequencer -> builder
+
+	// Error collection
+	errCh := make(chan error, numWorkers+3) // enough for all goroutines
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// --- Builder goroutine ---
+	var rootHash common.Hash
+	var tnStats trieNodeStats
+	var builderWg sync.WaitGroup
+	builderWg.Add(1)
+	go func() {
+		defer builderWg.Done()
+		sb := &streamingBuilder{
+			groupDepth: groupDepth,
+		}
+		if groupDepth > 0 {
+			sb.groupBuf = make(map[int][]groupChild)
+		}
+		if db != nil {
+			sb.w = &trieNodeWriter{batch: db.NewBatch(), db: db}
+		}
+
+		for r := range builderCh {
+			sb.feedStem(r.stem[:], r.hash, r.entries)
+		}
+
+		rootHash = sb.finish()
+		if sb.w != nil {
+			sb.w.flush()
+			tnStats = trieNodeStats{Nodes: sb.w.nodes, Bytes: sb.w.bytes}
+			log.Printf("Wrote %d trie nodes (%d MB)", sb.w.nodes, sb.w.bytes/1024/1024)
+		}
+	}()
+
+	// --- Resequencer goroutine ---
+	var reseqWg sync.WaitGroup
+	reseqWg.Add(1)
+	go func() {
+		defer reseqWg.Done()
+		defer close(builderCh)
+
+		pending := make(map[uint64]*stemResult)
+		nextSeq := uint64(0)
+
+		for r := range resultCh {
+			pending[r.seqNum] = r
+			for {
+				next, ok := pending[nextSeq]
+				if !ok {
+					break
+				}
+				delete(pending, nextSeq)
+				nextSeq++
+				select {
+				case builderCh <- next:
+				case <-ctx.Done():
+					errCh <- ctx.Err()
+					return
+				}
+			}
+		}
+	}()
+
+	// --- Worker goroutines ---
+	var workerWg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errCh <- fmt.Errorf("worker panic: %v", r)
+					cancel()
+				}
+			}()
+			for w := range workCh {
+				hash := computeStemNodeHash(w.stem[:], w.entries)
+				r := &stemResult{
+					seqNum:  w.seqNum,
+					stem:    w.stem,
+					hash:    hash,
+					entries: w.entries,
+				}
+				select {
+				case resultCh <- r:
+				case <-ctx.Done():
+					return
+				}
+				// Release semaphore after sending result
+				<-sem
+			}
+		}()
+	}
+
+	// Close resultCh after all workers finish
+	go func() {
+		workerWg.Wait()
+		close(resultCh)
+	}()
+
+	// --- Reader goroutine (runs on the calling goroutine) ---
+	var seqNum uint64
+	var currentStem [stemSize]byte
+	var currentEntries []trieEntry
+	hasCurrent := false
+
+	for iter.Next() {
+		var e trieEntry
+		copy(e.Key[:], iter.Key())
+		copy(e.Value[:], iter.Value())
+
+		if hasCurrent && !bytes.Equal(e.Key[:stemSize], currentStem[:]) {
+			// Stem boundary — dispatch the completed stem to workers
+			work := &stemWork{
+				seqNum:  seqNum,
+				stem:    currentStem,
+				entries: currentEntries,
+			}
+			seqNum++
+
+			// Acquire semaphore (blocks if 64 stems in flight)
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				goto done
+			}
+			select {
+			case workCh <- work:
+			case <-ctx.Done():
+				goto done
+			}
+			// Allocate fresh slice for next stem
+			currentEntries = make([]trieEntry, 0, 256)
+		}
+
+		if !hasCurrent {
+			currentEntries = make([]trieEntry, 0, 256)
+		}
+		hasCurrent = true
+		copy(currentStem[:], e.Key[:stemSize])
+		currentEntries = append(currentEntries, e)
+	}
+
+done:
+	iter.Release()
+
+	// Flush the last stem group
+	if len(currentEntries) > 0 && ctx.Err() == nil {
+		work := &stemWork{
+			seqNum:  seqNum,
+			stem:    currentStem,
+			entries: currentEntries,
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+		}
+		select {
+		case workCh <- work:
+		case <-ctx.Done():
+		}
+	}
+
+	// Signal workers: no more work
+	close(workCh)
+
+	// Wait for pipeline to drain: workers -> resequencer -> builder
+	workerWg.Wait()
+	// resultCh is closed by the dedicated goroutine above
+	reseqWg.Wait()
+	// builderCh is closed by resequencer
+	builderWg.Wait()
+
+	// Check for errors
+	select {
+	case err := <-errCh:
+		return common.Hash{}, trieNodeStats{}, err
+	default:
+	}
+
+	if ctx.Err() != nil {
+		return common.Hash{}, trieNodeStats{}, ctx.Err()
+	}
+
+	return rootHash, tnStats, nil
 }
