@@ -494,3 +494,40 @@ func TestGroupedEmissionLargeTraversal(t *testing.T) {
 		})
 	}
 }
+
+// TestParallelKeyDerivation verifies that parallel storage key derivation
+// produces identical trie entries as sequential derivation.
+func TestParallelKeyDerivation(t *testing.T) {
+	addr := common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	slots := make([]storageSlot, 500)
+	for i := range slots {
+		slots[i].Key = sha256.Sum256([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
+		slots[i].Value = sha256.Sum256([]byte{byte(i), 0xFF})
+		if slots[i].Value == (common.Hash{}) {
+			slots[i].Value[31] = 1
+		}
+	}
+
+	// Sequential
+	var seqEntries []trieEntry
+	for i := range slots {
+		seqEntries = collectStorageEntry(addr, slots[i], seqEntries)
+	}
+	sort.Slice(seqEntries, func(i, j int) bool {
+		return bytes.Compare(seqEntries[i].Key[:], seqEntries[j].Key[:]) < 0
+	})
+
+	// Parallel
+	parEntries := collectStorageEntriesParallel(addr, slots)
+
+	if len(seqEntries) != len(parEntries) {
+		t.Fatalf("entry count mismatch: seq=%d par=%d", len(seqEntries), len(parEntries))
+	}
+	for i := range seqEntries {
+		if seqEntries[i] != parEntries[i] {
+			t.Errorf("entry %d differs:\n  seq: key=%x val=%x\n  par: key=%x val=%x",
+				i, seqEntries[i].Key[:4], seqEntries[i].Value[:4],
+				parEntries[i].Key[:4], parEntries[i].Value[:4])
+		}
+	}
+}
