@@ -36,6 +36,11 @@ type StateWriter interface {
 	// WriteStorage writes a storage slot for an account.
 	WriteStorage(addr common.Address, incarnation uint64, slot, value common.Hash) error
 
+	// WriteRawStorage writes a storage slot using a pre-hashed trie key.
+	// The hashedSlot is used directly as the snapshot/trie key without
+	// keccak256 hashing. Used for phantom entries in deep-branch mode.
+	WriteRawStorage(addr common.Address, incarnation uint64, hashedSlot, value common.Hash) error
+
 	// WriteCode writes contract bytecode.
 	WriteCode(codeHash common.Hash, code []byte) error
 

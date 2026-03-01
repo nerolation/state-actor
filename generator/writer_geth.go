@@ -82,6 +82,20 @@ func (w *GethWriter) WriteStorage(addr common.Address, incarnation uint64, slot,
 	return w.bw.put(key, valueRLP, &w.storageBytes)
 }
 
+// WriteRawStorage writes a storage slot using a pre-hashed trie key.
+// The hashedSlot bypasses keccak256 and is used directly as the snapshot key.
+func (w *GethWriter) WriteRawStorage(addr common.Address, incarnation uint64, hashedSlot, value common.Hash) error {
+	addrHash := crypto.Keccak256Hash(addr[:])
+
+	valueRLP, err := gethEncodeStorageValue(value)
+	if err != nil {
+		return fmt.Errorf("encode storage value: %w", err)
+	}
+
+	key := gethStorageSnapshotKey(addrHash, hashedSlot)
+	return w.bw.put(key, valueRLP, &w.storageBytes)
+}
+
 // WriteCode writes contract bytecode.
 func (w *GethWriter) WriteCode(codeHash common.Hash, code []byte) error {
 	key := gethCodeKey(codeHash)

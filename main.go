@@ -33,20 +33,25 @@ import (
 )
 
 var (
-	dbPath       = flag.String("db", "", "Path to the database directory (required)")
-	accounts     = flag.Int("accounts", 1000, "Number of EOA accounts to create")
-	contracts    = flag.Int("contracts", 100, "Number of contracts to create")
-	maxSlots     = flag.Int("max-slots", 10000, "Maximum storage slots per contract")
-	minSlots     = flag.Int("min-slots", 1, "Minimum storage slots per contract")
-	distribution = flag.String("distribution", "power-law", "Storage distribution: 'power-law', 'uniform', or 'exponential'")
-	seed         = flag.Int64("seed", 0, "Random seed (0 = use current time)")
-	batchSize    = flag.Int("batch-size", 10000, "Database batch size")
-	workers      = flag.Int("workers", 0, "Number of parallel workers (0 = NumCPU)")
-	codeSize     = flag.Int("code-size", 1024, "Average contract code size in bytes")
-	verbose      = flag.Bool("verbose", false, "Verbose output")
-	benchmark    = flag.Bool("benchmark", false, "Run in benchmark mode (print detailed stats)")
+	dbPath         = flag.String("db", "", "Path to the database directory (required)")
+	accounts       = flag.Int("accounts", 1000, "Number of EOA accounts to create")
+	contracts      = flag.Int("contracts", 100, "Number of contracts to create")
+	maxSlots       = flag.Int("max-slots", 10000, "Maximum storage slots per contract")
+	minSlots       = flag.Int("min-slots", 1, "Minimum storage slots per contract")
+	distribution   = flag.String("distribution", "power-law", "Storage distribution: 'power-law', 'uniform', or 'exponential'")
+	seed           = flag.Int64("seed", 0, "Random seed (0 = use current time)")
+	batchSize      = flag.Int("batch-size", 10000, "Database batch size")
+	workers        = flag.Int("workers", 0, "Number of parallel workers (0 = NumCPU)")
+	codeSize       = flag.Int("code-size", 1024, "Average contract code size in bytes")
+	verbose        = flag.Bool("verbose", false, "Verbose output")
+	benchmark      = flag.Bool("benchmark", false, "Run in benchmark mode (print detailed stats)")
 	binaryTrie     = flag.Bool("binary-trie", false, "Generate state for binary trie mode (EIP-7864)")
 	commitInterval = flag.Int("commit-interval", 500000, "Binary trie: commit to disk every N trie insertions (default 500K, 0 = all in-memory)")
+
+	// Deep-branch accounts
+	deepBranchAccounts   = flag.Int("deep-branch-accounts", 0, "Number of additional contracts with deep storage tries (0 = disabled)")
+	deepBranchDepth      = flag.Int("deep-branch-depth", 64, "Branch depth per deep slot in nibbles (1-64)")
+	deepBranchKnownSlots = flag.Int("deep-branch-known-slots", 1, "Legitimate storage slots with known preimages per deep-branch account")
 
 	// Target size
 	targetSize = flag.String("target-size", "", "Target total DB size on disk (e.g. '5GB', '500MB'). Stops generating when estimated size is reached.")
@@ -117,6 +122,9 @@ func main() {
 		statsServer = generator.NewStatsServer(*statsPort)
 		liveStats = statsServer.Stats()
 		liveStats.SetConfig(*accounts, *contracts, *outputFormat, *distribution, *seed)
+		if *deepBranchAccounts > 0 {
+			liveStats.SetDeepBranch(*deepBranchAccounts, *deepBranchDepth, *deepBranchKnownSlots)
+		}
 		if err := statsServer.Start(); err != nil {
 			log.Fatalf("Failed to start stats server: %v", err)
 		}
@@ -153,6 +161,19 @@ func main() {
 		}
 	}
 
+	// Validate deep-branch flags
+	if *deepBranchAccounts > 0 {
+		if *outputFormat == "erigon" {
+			log.Fatalf("--deep-branch-accounts is not supported with --output-format erigon")
+		}
+		if *deepBranchDepth < 1 || *deepBranchDepth > 64 {
+			log.Fatalf("--deep-branch-depth must be 1-64, got %d", *deepBranchDepth)
+		}
+		if *deepBranchKnownSlots < 1 {
+			log.Fatalf("--deep-branch-known-slots must be >= 1, got %d", *deepBranchKnownSlots)
+		}
+	}
+
 	config := generator.Config{
 		DBPath:          *dbPath,
 		NumAccounts:     *accounts,
@@ -171,7 +192,12 @@ func main() {
 		InjectAddresses: injectAddrs,
 		TargetSize:      parsedTargetSize,
 		OutputFormat:    generator.ParseOutputFormat(*outputFormat),
-		LiveStats:       liveStats,
+		DeepBranch: generator.DeepBranchConfig{
+			NumAccounts: *deepBranchAccounts,
+			Depth:       *deepBranchDepth,
+			KnownSlots:  *deepBranchKnownSlots,
+		},
+		LiveStats: liveStats,
 	}
 
 	// Load genesis if provided
@@ -231,6 +257,10 @@ func main() {
 		if config.TargetSize > 0 {
 			log.Printf("  Target Size:  %s", formatBytes(config.TargetSize))
 		}
+		if config.DeepBranch.Enabled() {
+			log.Printf("  Deep Branch:  %d accounts, depth=%d, known_slots=%d",
+				config.DeepBranch.NumAccounts, config.DeepBranch.Depth, config.DeepBranch.KnownSlots)
+		}
 		if *genesisPath != "" {
 			log.Printf("  Genesis:      %s", *genesisPath)
 		}
@@ -289,6 +319,10 @@ func main() {
 		fmt.Printf("Total DB Size:     %s\n", formatBytes(dbSize))
 	}
 	fmt.Printf("Throughput:        %.2f slots/sec\n", float64(stats.StorageSlotsCreated)/elapsed.Seconds())
+	if stats.DeepBranchAccounts > 0 {
+		fmt.Printf("Deep Branch:       %d accounts, depth %d nibbles, %d known slots each\n",
+			stats.DeepBranchAccounts, stats.DeepBranchDepth, *deepBranchKnownSlots)
+	}
 	fmt.Printf("State Root:        %s\n", stats.StateRoot.Hex())
 
 	if genesisConfig != nil {

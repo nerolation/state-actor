@@ -175,6 +175,8 @@ type accountMeta struct {
 	genesisStorage map[common.Hash]common.Hash
 	genesisCode    []byte
 	genesisCH      common.Hash // pre-computed code hash for genesis
+	// Deep-branch fields
+	isDeepBranch bool // true if this is a deep-branch contract
 }
 
 // generateAccountMetas creates lightweight metadata for all accounts.
@@ -286,6 +288,46 @@ func (g *Generator) generateAccountMetas(stats *Stats) ([]*accountMeta, error) {
 	}
 	stats.ContractsCreated = genesisContracts + g.config.NumContracts
 
+	// Generate deep-branch contract accounts (additional, on top of random state)
+	if g.config.DeepBranch.Enabled() {
+		deepSlots := g.config.DeepBranch.KnownSlots * (1 + g.config.DeepBranch.Depth)
+		for i := 0; i < g.config.DeepBranch.NumAccounts; i++ {
+			var addr common.Address
+			g.rng.Read(addr[:])
+			for usedAddresses[addr] {
+				g.rng.Read(addr[:])
+			}
+			usedAddresses[addr] = true
+
+			metas = append(metas, &accountMeta{
+				address:      addr,
+				addrHash:     crypto.Keccak256Hash(addr[:]),
+				nonce:        1,
+				balance:      new(uint256.Int).Mul(uint256.NewInt(uint64(g.rng.Intn(100)+1)), uint256.NewInt(1e18)),
+				isContract:   true,
+				isDeepBranch: true,
+				numSlots:     deepSlots,
+				codeSize:     g.config.CodeSize + g.rng.Intn(g.config.CodeSize),
+				codeSeed:     g.rng.Int63(),
+			})
+
+			stats.StorageSlotsCreated += deepSlots
+			stats.ContractsCreated++
+
+			if g.config.LiveStats != nil {
+				g.config.LiveStats.AddContract(deepSlots)
+			}
+		}
+		stats.DeepBranchAccounts = g.config.DeepBranch.NumAccounts
+		stats.DeepBranchDepth = g.config.DeepBranch.Depth
+
+		if g.config.Verbose {
+			log.Printf("Added %d deep-branch contracts (depth=%d, known_slots=%d, %d entries each)",
+				g.config.DeepBranch.NumAccounts, g.config.DeepBranch.Depth,
+				g.config.DeepBranch.KnownSlots, deepSlots)
+		}
+	}
+
 	if g.config.Verbose {
 		log.Printf("Generated metadata for %d accounts, %d contracts with %d total storage slots",
 			stats.AccountsCreated, stats.ContractsCreated, stats.StorageSlotsCreated)
@@ -323,6 +365,46 @@ func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) erro
 			if meta.genesisStorage != nil {
 				storageSlots = mapToSortedSlots(meta.genesisStorage)
 			}
+		} else if meta.isDeepBranch {
+			// Deep-branch contract: generate code + phantom-injected storage
+			rng := mrand.New(mrand.NewSource(meta.codeSeed))
+			code = make([]byte, meta.codeSize)
+			rng.Read(code)
+			codeHash = crypto.Keccak256Hash(code)
+
+			entries := generateDeepBranchStorage(
+				g.config.DeepBranch.KnownSlots,
+				g.config.DeepBranch.Depth,
+				rng,
+			)
+
+			// Write storage and build trie directly from deep-branch entries
+			storageTrie := trie.NewStackTrie(nil)
+			for _, entry := range entries {
+				if entry.isPhantom {
+					if err := g.writer.WriteRawStorage(meta.address, 0, entry.trieKey, entry.value); err != nil {
+						return fmt.Errorf("write raw storage: %w", err)
+					}
+				} else {
+					if err := g.writer.WriteStorage(meta.address, 0, entry.rawSlotKey, entry.value); err != nil {
+						return fmt.Errorf("write storage: %w", err)
+					}
+				}
+
+				valueRLP, err := encodeStorageValue(entry.value)
+				if err != nil {
+					return err
+				}
+				storageTrie.Update(entry.trieKey[:], valueRLP)
+			}
+
+			stateAccount = types.StateAccount{
+				Nonce:    meta.nonce,
+				Balance:  meta.balance,
+				Root:     storageTrie.Hash(),
+				CodeHash: codeHash.Bytes(),
+			}
+			// storageSlots stays nil, so the normal storage block below is skipped
 		} else if meta.isContract {
 			// Generated contract: create code and storage from seed
 			rng := mrand.New(mrand.NewSource(meta.codeSeed))
@@ -904,12 +986,12 @@ type storageSlot struct {
 
 // accountData holds generated account data.
 type accountData struct {
-	address   common.Address
-	addrHash  common.Hash
-	account   *types.StateAccount
-	code      []byte
-	codeHash  common.Hash
-	storage   []storageSlot // pre-sorted by Key for deterministic trie insertion
+	address  common.Address
+	addrHash common.Hash
+	account  *types.StateAccount
+	code     []byte
+	codeHash common.Hash
+	storage  []storageSlot // pre-sorted by Key for deterministic trie insertion
 }
 
 // mapToSortedSlots converts a storage map to a sorted slice of storageSlot.

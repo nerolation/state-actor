@@ -29,13 +29,18 @@ type LiveStats struct {
 	CodeBytes           int64 `json:"codeBytes"`
 
 	// Timing
-	StartTime   time.Time `json:"startTime"`
-	ElapsedMs   int64     `json:"elapsedMs"`
-	Throughput  float64   `json:"throughput"` // slots/sec
+	StartTime  time.Time `json:"startTime"`
+	ElapsedMs  int64     `json:"elapsedMs"`
+	Throughput float64   `json:"throughput"` // slots/sec
 
 	// State
 	Phase     string `json:"phase"` // "init", "accounts", "contracts", "finalizing", "done"
 	StateRoot string `json:"stateRoot"`
+
+	// Deep-branch
+	DeepBranchAccounts   int `json:"deepBranchAccounts"`
+	DeepBranchDepth      int `json:"deepBranchDepth"`
+	DeepBranchKnownSlots int `json:"deepBranchKnownSlots"`
 
 	// Distribution histogram (slots per contract)
 	SlotHistogram []int `json:"slotHistogram"` // buckets: 0-10, 10-100, 100-1K, 1K-10K, 10K+
@@ -194,6 +199,15 @@ func (ls *LiveStats) SyncBytes(ws WriterStats) {
 	ls.StorageBytes = int64(ws.StorageBytes)
 	ls.CodeBytes = int64(ws.CodeBytes)
 	ls.TotalBytes = ls.AccountBytes + ls.StorageBytes + ls.CodeBytes
+}
+
+// SetDeepBranch configures deep-branch display fields.
+func (ls *LiveStats) SetDeepBranch(accounts, depth, knownSlots int) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	ls.DeepBranchAccounts = accounts
+	ls.DeepBranchDepth = depth
+	ls.DeepBranchKnownSlots = knownSlots
 }
 
 func (ls *LiveStats) SetStateRoot(root string) {
@@ -526,6 +540,20 @@ const dashboardHTML = `<!DOCTYPE html>
                     '<div class="card-title">state treemap (recent contracts by slot count)</div>' +
                     '<div class="treemap">' + buildTreemap(s.treemapData, 520, 180) + '</div>' +
                 '</div>' +
+                (s.deepBranchAccounts > 0 ?
+                    '<div class="card">' +
+                        '<div class="card-title">deep-branch accounts</div>' +
+                        '<div class="metric purple">' + s.deepBranchAccounts + '</div>' +
+                    '</div>' +
+                    '<div class="card">' +
+                        '<div class="card-title">trie depth</div>' +
+                        '<div class="metric purple">' + s.deepBranchDepth + '<span class="unit">nibbles</span></div>' +
+                    '</div>' +
+                    '<div class="card">' +
+                        '<div class="card-title">known preimage slots</div>' +
+                        '<div class="metric purple">' + s.deepBranchKnownSlots + '<span class="unit">/account</span></div>' +
+                    '</div>'
+                : '') +
                 (s.stateRoot ? '<div class="card span6"><div class="card-title">state root</div><div class="root-hash">' + s.stateRoot + '</div></div>' : '');
         }
 

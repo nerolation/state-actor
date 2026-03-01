@@ -121,6 +121,9 @@ state-actor \
 | `--inject-accounts` | - | Comma-separated hex addresses to pre-fund with 999999999 ETH |
 | `--chain-id` | 0 | Override genesis chainId (0 = use value from genesis.json) |
 | `--target-size` | - | Target total DB size on disk (e.g. `5GB`, `500MB`). Stops when reached. |
+| `--deep-branch-accounts` | 0 | Additional contracts with max-depth storage tries (0 = disabled) |
+| `--deep-branch-depth` | 64 | Branch depth in nibbles per deep slot (1-64) |
+| `--deep-branch-known-slots` | 1 | Legitimate storage slots with known preimages per deep-branch account |
 | `--verbose` | false | Verbose output |
 | `--benchmark` | false | Print detailed stats |
 
@@ -280,6 +283,22 @@ Exponential decay in slot counts. Middle ground between power-law and uniform.
 ```bash
 --distribution exponential
 ```
+
+## Deep-Branch Storage Tries
+
+The `--deep-branch-accounts` flag adds contracts whose storage tries have branch nodes at every nibble position — up to 64 levels deep with no extension nodes. This is useful for stress-testing client trie traversal performance.
+
+```bash
+state-actor --db ./chaindata --genesis genesis.json \
+    --accounts 10000 --contracts 5000 \
+    --deep-branch-accounts 2 --deep-branch-depth 64 --deep-branch-known-slots 3
+```
+
+**How it works**: For each deep-branch account, `M` legitimate storage slots use sequential indices (0, 1, ..., M-1) so `SLOAD` works via their known preimages. For each legitimate slot, `D` phantom entries are injected into the trie and snapshot — each sharing a progressively longer nibble prefix with the legitimate key's `keccak256` hash but diverging at exactly one position. This forces a branch node at every depth along the legitimate key's path.
+
+The phantom entries have no known preimage, so they cannot be accessed via `SLOAD`, but the legitimate slots traverse the full branch chain during reads.
+
+> **Note**: Deep-branch mode is only supported with `--output-format geth`. Erigon's PlainState uses unhashed keys, which is incompatible with phantom entry injection.
 
 ## Architecture
 

@@ -148,6 +148,13 @@ func (w *ErigonWriter) WriteStorage(addr common.Address, incarnation uint64, slo
 	return nil
 }
 
+// WriteRawStorage returns an error because deep-branch mode is not supported
+// with Erigon output format. Erigon's PlainState uses unhashed keys, and
+// phantom entries have no known preimage.
+func (w *ErigonWriter) WriteRawStorage(addr common.Address, incarnation uint64, hashedSlot, value common.Hash) error {
+	return fmt.Errorf("deep-branch storage mode is not supported with erigon output format")
+}
+
 // WriteCode buffers a code write.
 func (w *ErigonWriter) WriteCode(codeHash common.Hash, code []byte) error {
 	w.mu.Lock()

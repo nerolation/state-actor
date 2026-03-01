@@ -237,6 +237,10 @@ Real Ethereum state follows a power-law distribution: a few contracts (Uniswap, 
 
 When merging genesis accounts, we preserve their exact addresses (not random). This ensures validator addresses, system contracts, and prefunded accounts work correctly.
 
+### Deep-Branch Phantom Injection
+
+Deep-branch accounts use phantom entries to force branch nodes at every nibble depth in a storage trie. For a legitimate slot with trie key `T = keccak256(pad32(slotIndex))`, we construct `D` phantom keys where phantom `d` matches `T` on nibbles `[0..d-1]` but differs at nibble `d`. These are written to the snapshot via `WriteRawStorage` (bypassing `keccak256`) and inserted directly into the StackTrie. The legitimate slot's `SLOAD` path traverses all `D` branch nodes.
+
 ### Parallel Batch Writers
 
 Pebble performs best with parallel batch commits. We use a worker pool to maximize throughput while maintaining ordering within batches.
@@ -249,6 +253,10 @@ state-actor/
 ├── generator/
 │   ├── config.go              # Configuration types
 │   ├── generator.go           # Core generation logic
+│   ├── deep_branch.go         # Deep-branch phantom key construction
+│   ├── writer.go              # StateWriter interface
+│   ├── writer_geth.go         # Geth/Pebble snapshot writer
+│   ├── writer_erigon.go       # Erigon/MDBX PlainState writer
 │   └── generator_test.go      # Unit tests
 ├── genesis/
 │   ├── genesis.go             # Genesis loading and writing
