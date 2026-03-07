@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/erigontech/mdbx-go/mdbx"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -115,8 +116,7 @@ func TestEndToEndWithGenesis(t *testing.T) {
 	}
 
 	// Write genesis block
-	ancientDir := filepath.Join(config.DBPath, "ancient")
-	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot, false, ancientDir)
+	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot, false)
 	if err != nil {
 		stateGen.Close()
 		t.Fatalf("Failed to write genesis block: %v", err)
@@ -297,8 +297,7 @@ func TestEndToEndWithGenesisBinaryTrie(t *testing.T) {
 	}
 
 	// Write genesis block with binary trie enabled
-	ancientDir2 := filepath.Join(config.DBPath, "ancient")
-	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot, true, ancientDir2)
+	block, err := genesis.WriteGenesisBlock(stateGen.DB(), gen, stats.StateRoot, true)
 	if err != nil {
 		stateGen.Close()
 		t.Fatalf("Failed to write genesis block: %v", err)
@@ -401,7 +400,7 @@ func TestDatabaseReadableByRawDB(t *testing.T) {
 
 	// Write a genesis block
 	stateRoot := common.HexToHash("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
-	block, err := genesis.WriteGenesisBlock(db, &gen, stateRoot, false, "")
+	block, err := genesis.WriteGenesisBlock(db, &gen, stateRoot, false)
 	if err != nil {
 		t.Fatalf("Failed to write genesis block: %v", err)
 	}
@@ -496,96 +495,346 @@ func TestEndToEndErigonFormat(t *testing.T) {
 	}
 }
 
-// TestBothFormatsProduceSameStateRoot verifies that geth and erigon formats
-// produce the same state root for identical input.
-func TestBothFormatsProduceSameStateRoot(t *testing.T) {
+// TestAllFormatsProduceSameStateRoot verifies that geth, erigon, and nethermind
+// formats all produce the same state root for identical input.
+func TestAllFormatsProduceSameStateRoot(t *testing.T) {
 	seed := int64(12345)
 
-	// Generate with geth format
-	gethDir, err := os.MkdirTemp("", "geth-compare-*")
+	formats := []struct {
+		name   string
+		format generator.OutputFormat
+	}{
+		{"geth", generator.OutputGeth},
+		{"erigon", generator.OutputErigon},
+		{"nethermind", generator.OutputNethermind},
+	}
+
+	type result struct {
+		stats *generator.Stats
+	}
+	results := make(map[string]result)
+
+	for _, f := range formats {
+		t.Run(f.name, func(t *testing.T) {
+			dir, err := os.MkdirTemp("", f.name+"-compare-*")
+			if err != nil {
+				t.Fatalf("Failed to create temp dir: %v", err)
+			}
+			defer os.RemoveAll(dir)
+
+			config := generator.Config{
+				DBPath:       dir,
+				NumAccounts:  30,
+				NumContracts: 15,
+				MaxSlots:     50,
+				MinSlots:     1,
+				Distribution: generator.Uniform,
+				Seed:         seed,
+				BatchSize:    1000,
+				Workers:      4,
+				CodeSize:     256,
+				OutputFormat: f.format,
+			}
+
+			gen, err := generator.New(config)
+			if err != nil {
+				t.Fatalf("Failed to create %s generator: %v", f.name, err)
+			}
+
+			stats, err := gen.Generate()
+			if err != nil {
+				gen.Close()
+				t.Fatalf("Failed to generate %s state: %v", f.name, err)
+			}
+			gen.Close()
+
+			results[f.name] = result{stats: stats}
+
+			if stats.StateRoot == (common.Hash{}) {
+				t.Errorf("%s: state root should not be zero", f.name)
+			}
+
+			t.Logf("%s: root=%s accounts=%d contracts=%d slots=%d",
+				f.name, stats.StateRoot.Hex(),
+				stats.AccountsCreated, stats.ContractsCreated, stats.StorageSlotsCreated)
+		})
+	}
+
+	// Compare all pairs
+	geth := results["geth"]
+	erigon := results["erigon"]
+	nethermind := results["nethermind"]
+
+	if geth.stats == nil || erigon.stats == nil || nethermind.stats == nil {
+		t.Fatal("One or more formats failed to produce stats")
+	}
+
+	if geth.stats.StateRoot != erigon.stats.StateRoot {
+		t.Errorf("State root mismatch geth vs erigon:\n  geth:   %s\n  erigon: %s",
+			geth.stats.StateRoot.Hex(), erigon.stats.StateRoot.Hex())
+	}
+	if geth.stats.StateRoot != nethermind.stats.StateRoot {
+		t.Errorf("State root mismatch geth vs nethermind:\n  geth:       %s\n  nethermind: %s",
+			geth.stats.StateRoot.Hex(), nethermind.stats.StateRoot.Hex())
+	}
+
+	// Verify all stats match
+	for _, name := range []string{"erigon", "nethermind"} {
+		other := results[name]
+		if geth.stats.AccountsCreated != other.stats.AccountsCreated {
+			t.Errorf("AccountsCreated mismatch geth(%d) vs %s(%d)",
+				geth.stats.AccountsCreated, name, other.stats.AccountsCreated)
+		}
+		if geth.stats.ContractsCreated != other.stats.ContractsCreated {
+			t.Errorf("ContractsCreated mismatch geth(%d) vs %s(%d)",
+				geth.stats.ContractsCreated, name, other.stats.ContractsCreated)
+		}
+		if geth.stats.StorageSlotsCreated != other.stats.StorageSlotsCreated {
+			t.Errorf("StorageSlotsCreated mismatch geth(%d) vs %s(%d)",
+				geth.stats.StorageSlotsCreated, name, other.stats.StorageSlotsCreated)
+		}
+	}
+
+	t.Logf("All three formats produced identical state root: %s", geth.stats.StateRoot.Hex())
+}
+
+// TestAllFormatsWithGenesisProduceSameStateRoot verifies that all three output
+// formats produce the same state root when initialized from the same genesis file.
+// This is the core invariant: all clients must start with identical state.
+func TestAllFormatsWithGenesisProduceSameStateRoot(t *testing.T) {
+	genesisJSON := `{
+		"config": {
+			"chainId": 32382,
+			"homesteadBlock": 0,
+			"eip150Block": 0,
+			"eip155Block": 0,
+			"eip158Block": 0,
+			"byzantiumBlock": 0,
+			"constantinopleBlock": 0,
+			"petersburgBlock": 0,
+			"istanbulBlock": 0,
+			"berlinBlock": 0,
+			"londonBlock": 0,
+			"mergeNetsplitBlock": 0,
+			"shanghaiTime": 0,
+			"cancunTime": 0,
+			"terminalTotalDifficulty": 0
+		},
+		"nonce": "0x0",
+		"timestamp": "0x0",
+		"extraData": "0x",
+		"gasLimit": "0x1c9c380",
+		"difficulty": "0x0",
+		"mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+		"coinbase": "0x0000000000000000000000000000000000000000",
+		"alloc": {
+			"0x123463a4b065722e99115d6c222f267d9cabb524": {
+				"balance": "0x43c33c1937564800000"
+			},
+			"0x8943545177806ed17b9f23f0a21ee5948ecaa776": {
+				"code": "0x60606040523615600e57600e565b5b603f806100196000396000f3006060604052361560025760025b5b60006000fd00",
+				"balance": "0x1"
+			},
+			"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef": {
+				"code": "0x6000",
+				"balance": "0x0",
+				"nonce": "0x1",
+				"storage": {
+					"0x0000000000000000000000000000000000000000000000000000000000000001": "0x0000000000000000000000000000000000000000000000000000000000000042"
+				}
+			}
+		},
+		"number": "0x0",
+		"gasUsed": "0x0",
+		"parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+	}`
+
+	// Write shared genesis file
+	dir := t.TempDir()
+	genesisPath := filepath.Join(dir, "genesis.json")
+	if err := os.WriteFile(genesisPath, []byte(genesisJSON), 0644); err != nil {
+		t.Fatalf("Failed to write genesis file: %v", err)
+	}
+
+	gen, err := genesis.LoadGenesis(genesisPath)
 	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(gethDir)
-
-	gethConfig := generator.Config{
-		DBPath:       gethDir,
-		NumAccounts:  30,
-		NumContracts: 15,
-		MaxSlots:     50,
-		MinSlots:     1,
-		Distribution: generator.Uniform,
-		Seed:         seed,
-		BatchSize:    1000,
-		Workers:      4,
-		CodeSize:     256,
-		OutputFormat: generator.OutputGeth,
+		t.Fatalf("Failed to load genesis: %v", err)
 	}
 
-	gethGen, err := generator.New(gethConfig)
+	genesisAccounts := gen.ToStateAccounts()
+	genesisStorage := gen.GetAllocStorage()
+	genesisCode := gen.GetAllocCode()
+
+	seed := int64(42)
+
+	formats := []struct {
+		name   string
+		format generator.OutputFormat
+	}{
+		{"geth", generator.OutputGeth},
+		{"erigon", generator.OutputErigon},
+		{"nethermind", generator.OutputNethermind},
+	}
+
+	type result struct {
+		stats *generator.Stats
+		dir   string
+	}
+	results := make(map[string]result)
+
+	for _, f := range formats {
+		fDir, err := os.MkdirTemp(dir, f.name+"-*")
+		if err != nil {
+			t.Fatalf("Failed to create temp dir for %s: %v", f.name, err)
+		}
+
+		config := generator.Config{
+			DBPath:          fDir,
+			NumAccounts:     50,
+			NumContracts:    25,
+			MaxSlots:        100,
+			MinSlots:        5,
+			Distribution:    generator.PowerLaw,
+			Seed:            seed,
+			BatchSize:       1000,
+			Workers:         1,
+			CodeSize:        256,
+			OutputFormat:    f.format,
+			GenesisAccounts: genesisAccounts,
+			GenesisStorage:  genesisStorage,
+			GenesisCode:     genesisCode,
+		}
+
+		stateGen, err := generator.New(config)
+		if err != nil {
+			t.Fatalf("Failed to create %s generator: %v", f.name, err)
+		}
+
+		stats, err := stateGen.Generate()
+		if err != nil {
+			stateGen.Close()
+			t.Fatalf("Failed to generate %s state: %v", f.name, err)
+		}
+
+		// Write genesis via the writer
+		if err := stateGen.Writer().WriteGenesis(gen, stats.StateRoot, false); err != nil {
+			stateGen.Close()
+			t.Fatalf("Failed to write %s genesis: %v", f.name, err)
+		}
+
+		stateGen.Close()
+		results[f.name] = result{stats: stats, dir: fDir}
+
+		t.Logf("%s: root=%s accounts=%d contracts=%d slots=%d",
+			f.name, stats.StateRoot.Hex(),
+			stats.AccountsCreated, stats.ContractsCreated, stats.StorageSlotsCreated)
+	}
+
+	// All three must produce the same state root
+	geth := results["geth"]
+	erigon := results["erigon"]
+	nethermind := results["nethermind"]
+
+	if geth.stats.StateRoot != erigon.stats.StateRoot {
+		t.Errorf("State root mismatch geth vs erigon:\n  geth:   %s\n  erigon: %s",
+			geth.stats.StateRoot.Hex(), erigon.stats.StateRoot.Hex())
+	}
+	if geth.stats.StateRoot != nethermind.stats.StateRoot {
+		t.Errorf("State root mismatch geth vs nethermind:\n  geth:       %s\n  nethermind: %s",
+			geth.stats.StateRoot.Hex(), nethermind.stats.StateRoot.Hex())
+	}
+
+	// Verify stat counts match across all formats
+	for _, name := range []string{"erigon", "nethermind"} {
+		other := results[name]
+		if geth.stats.AccountsCreated != other.stats.AccountsCreated {
+			t.Errorf("AccountsCreated mismatch geth(%d) vs %s(%d)",
+				geth.stats.AccountsCreated, name, other.stats.AccountsCreated)
+		}
+		if geth.stats.ContractsCreated != other.stats.ContractsCreated {
+			t.Errorf("ContractsCreated mismatch geth(%d) vs %s(%d)",
+				geth.stats.ContractsCreated, name, other.stats.ContractsCreated)
+		}
+		if geth.stats.StorageSlotsCreated != other.stats.StorageSlotsCreated {
+			t.Errorf("StorageSlotsCreated mismatch geth(%d) vs %s(%d)",
+				geth.stats.StorageSlotsCreated, name, other.stats.StorageSlotsCreated)
+		}
+	}
+
+	// Verify Geth DB has the correct snapshot root and genesis metadata.
+	// We use direct KV reads since pebble.Database doesn't implement
+	// ethdb.Reader (no Ancient support), which rawdb functions require.
+	gethDB, err := pebble.New(geth.dir, 128, 64, "verify/", true)
 	if err != nil {
-		t.Fatalf("Failed to create geth generator: %v", err)
+		t.Fatalf("Failed to reopen geth DB: %v", err)
 	}
+	defer gethDB.Close()
 
-	gethStats, err := gethGen.Generate()
-	gethGen.Close()
+	// SnapshotRoot must match the computed state root
+	snapshotRoot, err := gethDB.Get([]byte("SnapshotRoot"))
 	if err != nil {
-		t.Fatalf("Failed to generate geth state: %v", err)
+		t.Errorf("Geth: SnapshotRoot not found: %v", err)
+	} else if common.BytesToHash(snapshotRoot) != geth.stats.StateRoot {
+		t.Errorf("Geth: SnapshotRoot mismatch: got %x, want %s",
+			snapshotRoot, geth.stats.StateRoot.Hex())
 	}
 
-	// Generate with erigon format
-	erigonDir, err := os.MkdirTemp("", "erigon-compare-*")
+	// HeadBlockHash key must be present (genesis block was written)
+	headHash, err := gethDB.Get([]byte("LastBlock"))
 	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(erigonDir)
-
-	erigonConfig := generator.Config{
-		DBPath:       erigonDir,
-		NumAccounts:  30,
-		NumContracts: 15,
-		MaxSlots:     50,
-		MinSlots:     1,
-		Distribution: generator.Uniform,
-		Seed:         seed,
-		BatchSize:    1000,
-		Workers:      4,
-		CodeSize:     256,
-		OutputFormat: generator.OutputErigon,
+		t.Errorf("Geth: head block hash not found: %v", err)
+	} else if len(headHash) == 0 {
+		t.Error("Geth: head block hash is empty")
 	}
 
-	erigonGen, err := generator.New(erigonConfig)
+	// Verify some genesis alloc accounts are in the snapshot layer
+	for _, addr := range []common.Address{
+		common.HexToAddress("0x123463a4b065722e99115d6c222f267d9cabb524"),
+		common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+	} {
+		addrHash := crypto.Keccak256Hash(addr[:])
+		key := append([]byte("a"), addrHash[:]...)
+		data, err := gethDB.Get(key)
+		if err != nil {
+			t.Errorf("Geth: genesis account %s not found: %v", addr.Hex(), err)
+		} else if len(data) == 0 {
+			t.Errorf("Geth: genesis account %s has empty data", addr.Hex())
+		}
+	}
+
+	// Verify Nethermind MDBX database has state root and chain ID in Config table
+	nmEnv, err := mdbx.NewEnv()
 	if err != nil {
-		t.Fatalf("Failed to create erigon generator: %v", err)
+		t.Fatalf("Failed to create mdbx env for nethermind: %v", err)
 	}
+	if err := nmEnv.SetOption(mdbx.OptMaxDB, 100); err != nil {
+		t.Fatalf("Failed to set max dbs: %v", err)
+	}
+	if err := nmEnv.Open(nethermind.dir, uint(mdbx.Readonly|mdbx.NoReadahead), 0644); err != nil {
+		t.Fatalf("Failed to open nethermind mdbx: %v", err)
+	}
+	defer nmEnv.Close()
 
-	erigonStats, err := erigonGen.Generate()
-	erigonGen.Close()
-	if err != nil {
-		t.Fatalf("Failed to generate erigon state: %v", err)
-	}
+	nmEnv.View(func(txn *mdbx.Txn) error {
+		dbi, err := txn.OpenDBI("Config", 0, nil, nil)
+		if err != nil {
+			t.Fatalf("Nethermind: Config table not found: %v", err)
+		}
+		stateRootVal, err := txn.Get(dbi, []byte("StateRoot"))
+		if err != nil {
+			t.Errorf("Nethermind: StateRoot not found in Config: %v", err)
+		} else if common.BytesToHash(stateRootVal) != nethermind.stats.StateRoot {
+			t.Errorf("Nethermind: StateRoot mismatch: got %x, want %s",
+				stateRootVal, nethermind.stats.StateRoot.Hex())
+		}
+		chainIDVal, err := txn.Get(dbi, []byte("ChainID"))
+		if err != nil {
+			t.Errorf("Nethermind: ChainID not found in Config: %v", err)
+		} else if len(chainIDVal) != 8 {
+			t.Errorf("Nethermind: ChainID wrong length: %d", len(chainIDVal))
+		}
+		return nil
+	})
 
-	// State roots should be identical
-	if gethStats.StateRoot != erigonStats.StateRoot {
-		t.Errorf("State root mismatch:\n  geth:   %s\n  erigon: %s",
-			gethStats.StateRoot.Hex(), erigonStats.StateRoot.Hex())
-	}
-
-	// Stats should be identical
-	if gethStats.AccountsCreated != erigonStats.AccountsCreated {
-		t.Errorf("Account count mismatch: geth=%d, erigon=%d",
-			gethStats.AccountsCreated, erigonStats.AccountsCreated)
-	}
-	if gethStats.ContractsCreated != erigonStats.ContractsCreated {
-		t.Errorf("Contract count mismatch: geth=%d, erigon=%d",
-			gethStats.ContractsCreated, erigonStats.ContractsCreated)
-	}
-	if gethStats.StorageSlotsCreated != erigonStats.StorageSlotsCreated {
-		t.Errorf("Storage slot count mismatch: geth=%d, erigon=%d",
-			gethStats.StorageSlotsCreated, erigonStats.StorageSlotsCreated)
-	}
-
-	t.Logf("Both formats produced identical state root: %s", gethStats.StateRoot.Hex())
-	t.Logf("Stats: accounts=%d, contracts=%d, slots=%d",
-		gethStats.AccountsCreated, gethStats.ContractsCreated, gethStats.StorageSlotsCreated)
+	t.Logf("All three formats produced identical state root: %s", geth.stats.StateRoot.Hex())
 }

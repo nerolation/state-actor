@@ -10,8 +10,8 @@ import (
 	"github.com/erigontech/mdbx-go/mdbx"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
+	"github.com/nerolation/state-actor/genesis"
 )
 
 // ErigonWriter writes state to an Erigon-compatible MDBX database.
@@ -170,10 +170,11 @@ func (w *ErigonWriter) SetStateRoot(root common.Hash) error {
 	})
 }
 
-// WriteGenesisBlock writes genesis metadata (simplified).
-func (w *ErigonWriter) WriteGenesisBlock(config *params.ChainConfig, stateRoot common.Hash) error {
-	// For now, just write the chain ID and state root
-	// Full genesis writing would require more Erigon-specific logic
+// WriteGenesis writes genesis metadata to the MDBX Config table.
+func (w *ErigonWriter) WriteGenesis(genesisConfig *genesis.Genesis, stateRoot common.Hash, binaryTrie bool) error {
+	if genesisConfig == nil || genesisConfig.Config == nil {
+		return nil
+	}
 	return w.env.Update(func(txn *mdbx.Txn) error {
 		dbi, err := txn.OpenDBI(erigonConfig, 0, nil, nil)
 		if err != nil {
@@ -182,7 +183,7 @@ func (w *ErigonWriter) WriteGenesisBlock(config *params.ChainConfig, stateRoot c
 
 		// Write chain ID
 		chainIDBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(chainIDBytes, config.ChainID.Uint64())
+		binary.BigEndian.PutUint64(chainIDBytes, genesisConfig.Config.ChainID.Uint64())
 		if err := txn.Put(dbi, []byte("ChainID"), chainIDBytes, 0); err != nil {
 			return err
 		}

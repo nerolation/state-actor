@@ -69,6 +69,23 @@ func New(config Config) (*Generator, error) {
 			return nil, fmt.Errorf("failed to create erigon writer: %w", err)
 		}
 
+	case OutputNethermind:
+		// Nethermind uses MDBX with hashed keys and RLP encoding.
+		// A Pebble DB is still needed for MPT state root computation.
+		if config.TrieMode == TrieModeBinary || config.WriteTrieNodes {
+			db, err = pebble.New(config.DBPath+".geth-temp", 512, 256, "stategen/", false)
+			if err != nil {
+				return nil, fmt.Errorf("failed to open temp database: %w", err)
+			}
+		}
+		writer, err = NewNethermindWriter(config.DBPath)
+		if err != nil {
+			if db != nil {
+				db.Close()
+			}
+			return nil, fmt.Errorf("failed to create nethermind writer: %w", err)
+		}
+
 	case OutputGeth:
 		fallthrough
 	default:
@@ -99,8 +116,8 @@ func (g *Generator) Close() error {
 		}
 	}
 
-	// For Erigon format, db may be a separate temp DB
-	if g.db != nil && g.config.OutputFormat == OutputErigon {
+	// For non-Geth formats, db may be a separate temp DB
+	if g.db != nil && g.config.OutputFormat != OutputGeth {
 		if err := g.db.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close temp db: %w", err))
 		}
@@ -115,6 +132,11 @@ func (g *Generator) Close() error {
 // DB returns the underlying database for external writes (e.g., genesis block).
 func (g *Generator) DB() ethdb.KeyValueStore {
 	return g.db
+}
+
+// Writer returns the underlying state writer.
+func (g *Generator) Writer() StateWriter {
+	return g.writer
 }
 
 // Generate generates the state and returns statistics.
@@ -286,6 +308,24 @@ func (g *Generator) generateAccountMetas(stats *Stats) ([]*accountMeta, error) {
 	}
 	stats.ContractsCreated = genesisContracts + g.config.NumContracts
 
+	// Inject explicitly-requested addresses (e.g. funded dev accounts).
+	for _, addr := range g.config.InjectAddresses {
+		if usedAddresses[addr] {
+			continue
+		}
+		usedAddresses[addr] = true
+		metas = append(metas, &accountMeta{
+			address:  addr,
+			addrHash: crypto.Keccak256Hash(addr[:]),
+			nonce:    0,
+			balance:  new(uint256.Int).Mul(uint256.NewInt(999999999), uint256.NewInt(1e18)),
+		})
+		stats.AccountsCreated++
+		if g.config.Verbose {
+			log.Printf("Injected account %s with 999999999 ETH", addr.Hex())
+		}
+	}
+
 	if g.config.Verbose {
 		log.Printf("Generated metadata for %d accounts, %d contracts with %d total storage slots",
 			stats.AccountsCreated, stats.ContractsCreated, stats.StorageSlotsCreated)
@@ -303,7 +343,19 @@ func (g *Generator) generateAccountMetas(stats *Stats) ([]*accountMeta, error) {
 // For each account: generate storage → compute storage root → write to DB → discard.
 // This keeps memory bounded by the largest single contract's storage.
 func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) error {
-	accountTrie := trie.NewStackTrie(nil)
+	// For Geth format, write hash-scheme trie nodes so Geth can resolve the
+	// state root on startup. Other formats only need the flat state.
+	var trieNodeWriter trie.OnTrieNode
+	if g.config.WriteTrieNodes && g.db != nil {
+		trieNodeWriter = func(path []byte, hash common.Hash, blob []byte) {
+			if err := g.db.Put(hash.Bytes(), blob); err != nil {
+				log.Printf("WARNING: failed to write trie node: %v", err)
+			}
+			stats.TrieNodeBytes += uint64(len(hash) + len(blob))
+		}
+	}
+
+	accountTrie := trie.NewStackTrie(trieNodeWriter)
 
 	processedCount := 0
 	totalCount := len(metas)
@@ -363,7 +415,7 @@ func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) erro
 
 		// Compute storage root and write storage via StateWriter
 		if len(storageSlots) > 0 {
-			storageTrie := trie.NewStackTrie(nil)
+			storageTrie := trie.NewStackTrie(trieNodeWriter)
 
 			// MPT requires keys sorted by Keccak256(key)
 			type keyWithHash struct {
@@ -408,9 +460,12 @@ func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) erro
 			return fmt.Errorf("write account: %w", err)
 		}
 
-		// Add to account trie
-		slimData := types.SlimAccountRLP(stateAccount)
-		accountTrie.Update(meta.addrHash[:], slimData)
+		// Add to account trie (full StateAccount RLP, not slim)
+		accountRLP, err := rlp.EncodeToBytes(&stateAccount)
+		if err != nil {
+			return fmt.Errorf("encode account: %w", err)
+		}
+		accountTrie.Update(meta.addrHash[:], accountRLP)
 
 		// Collect sample addresses
 		if meta.isContract {
@@ -1360,9 +1415,12 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 			return fmt.Errorf("write account: %w", err)
 		}
 
-		// Add to account trie for root computation
-		slimData := types.SlimAccountRLP(*acc.account)
-		accountTrie.Update(acc.addrHash[:], slimData)
+		// Add to account trie for root computation (full StateAccount RLP, not slim)
+		accountRLP, err := rlp.EncodeToBytes(acc.account)
+		if err != nil {
+			return fmt.Errorf("encode account: %w", err)
+		}
+		accountTrie.Update(acc.addrHash[:], accountRLP)
 	}
 
 	// Flush all pending writes

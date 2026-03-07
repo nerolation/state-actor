@@ -2,7 +2,6 @@ package generator
 
 import (
 	"fmt"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 
@@ -11,9 +10,8 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
-	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/nerolation/state-actor/genesis"
+	genesispkg "github.com/nerolation/state-actor/genesis"
 )
 
 // GethWriter writes state to a geth-compatible Pebble database.
@@ -93,11 +91,13 @@ func (w *GethWriter) SetStateRoot(root common.Hash) error {
 	return w.db.Put([]byte("SnapshotRoot"), root[:])
 }
 
-// WriteGenesisBlock writes the genesis block using the genesis package.
-func (w *GethWriter) WriteGenesisBlock(config *params.ChainConfig, stateRoot common.Hash) error {
-	// This requires the genesis config to be passed through
-	// For now, return nil - the caller handles this via genesis.WriteGenesisBlock
-	return nil
+// WriteGenesis writes the genesis block and all associated metadata to the Pebble DB.
+func (w *GethWriter) WriteGenesis(genesisConfig *genesispkg.Genesis, stateRoot common.Hash, binaryTrie bool) error {
+	if genesisConfig == nil {
+		return nil
+	}
+	_, err := genesispkg.WriteGenesisBlock(w.db, genesisConfig, stateRoot, binaryTrie)
+	return err
 }
 
 // Flush commits all pending writes.
@@ -118,13 +118,6 @@ func (w *GethWriter) Stats() WriterStats {
 		StorageBytes: w.storageBytes.Load(),
 		CodeBytes:    w.codeBytes.Load(),
 	}
-}
-
-// WriteGenesisBlockFull writes the genesis block with full genesis config.
-func (w *GethWriter) WriteGenesisBlockFull(genesisConfig *genesis.Genesis, stateRoot common.Hash, binaryTrie bool) error {
-	ancientDir := filepath.Join(w.dbPath, "ancient")
-	_, err := genesis.WriteGenesisBlock(w.db, genesisConfig, stateRoot, binaryTrie, ancientDir)
-	return err
 }
 
 // --- Batch writer for parallel writes ---

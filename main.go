@@ -1,15 +1,14 @@
 // Package main provides a tool for generating realistic Ethereum state
-// in a Pebble database compatible with go-ethereum.
+// compatible with multiple execution clients (Geth, Erigon, Nethermind).
 //
-// The tool writes state directly to the snapshot layer, which is the
-// authoritative source for state in modern geth. The trie can be
-// regenerated from snapshots on node startup.
+// Each client has a dedicated output format:
+// - Geth:       Pebble database with snapshot layer (ready to use without geth init)
+// - Erigon:     MDBX database with PlainState format
+// - Nethermind: MDBX database with hashed keys and RLP encoding
 //
-// When a genesis file is provided, the tool:
-// 1. Includes genesis alloc accounts in state generation
-// 2. Computes the combined state root
-// 3. Writes the genesis block with the correct state root
-// 4. Produces a database ready to use without `geth init`
+// A post-merge genesis config is built programmatically from --chain-id.
+// No genesis.json or chainspec file is needed; all data is written
+// directly into each client's database.
 package main
 
 import (
@@ -17,7 +16,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"math/big"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,7 +27,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/nerolation/state-actor/generator"
-	"github.com/nerolation/state-actor/genesis"
+	genesispkg "github.com/nerolation/state-actor/genesis"
 )
 
 var (
@@ -52,12 +50,11 @@ var (
 	targetSize = flag.String("target-size", "", "Target total DB size on disk (e.g. '5GB', '500MB'). Stops generating when estimated size is reached.")
 
 	// Genesis integration
-	genesisPath    = flag.String("genesis", "", "Path to genesis.json file (optional)")
 	injectAccounts = flag.String("inject-accounts", "", "Comma-separated hex addresses to inject with 999999999 ETH (e.g. 0xf39F...2266)")
-	chainID        = flag.Int64("chain-id", 0, "Override genesis chainId (0 = use value from genesis.json)")
+	chainID        = flag.Int64("chain-id", 1, "Chain ID for the genesis config")
 
 	// Output format
-	outputFormat = flag.String("output-format", "geth", "Output database format: 'geth' (Pebble) or 'erigon' (MDBX)")
+	outputFormat = flag.String("output-format", "geth", "Output format: 'geth' (Pebble DB), 'erigon' (MDBX), or 'nethermind' (chainspec JSON)")
 
 	// Stats server
 	statsPort = flag.Int("stats-port", 0, "Port for live stats HTTP server (0 = disabled)")
@@ -167,37 +164,15 @@ func main() {
 		Verbose:         *verbose,
 		TrieMode:        trieMode,
 		CommitInterval:  *commitInterval,
-		WriteTrieNodes:  *genesisPath != "",
+		WriteTrieNodes:  true,
 		InjectAddresses: injectAddrs,
 		TargetSize:      parsedTargetSize,
 		OutputFormat:    generator.ParseOutputFormat(*outputFormat),
 		LiveStats:       liveStats,
 	}
 
-	// Load genesis if provided
-	var genesisConfig *genesis.Genesis
-	if *genesisPath != "" {
-		var err error
-		genesisConfig, err = genesis.LoadGenesis(*genesisPath)
-		if err != nil {
-			log.Fatalf("Failed to load genesis: %v", err)
-		}
-
-		// Extract accounts from genesis alloc
-		config.GenesisAccounts = genesisConfig.ToStateAccounts()
-		config.GenesisStorage = genesisConfig.GetAllocStorage()
-		config.GenesisCode = genesisConfig.GetAllocCode()
-
-		// Override chain ID if requested
-		if *chainID != 0 {
-			genesisConfig.Config.ChainID = big.NewInt(*chainID)
-		}
-
-		if *verbose {
-			log.Printf("Loaded genesis with %d alloc accounts (chainId=%s)",
-				len(config.GenesisAccounts), genesisConfig.Config.ChainID)
-		}
-	}
+	// Build genesis config programmatically (no file needed).
+	genesisConfig := genesispkg.DefaultGenesis(uint64(*chainID))
 
 	if *verbose {
 		log.Printf("Configuration:")
@@ -231,9 +206,7 @@ func main() {
 		if config.TargetSize > 0 {
 			log.Printf("  Target Size:  %s", formatBytes(config.TargetSize))
 		}
-		if *genesisPath != "" {
-			log.Printf("  Genesis:      %s", *genesisPath)
-		}
+		log.Printf("  Chain ID:     %d", *chainID)
 	}
 
 	start := time.Now()
@@ -255,22 +228,12 @@ func main() {
 		liveStats.SetStateRoot(stats.StateRoot.Hex())
 	}
 
-	// Write genesis block if genesis was provided
-	if genesisConfig != nil {
-		if *verbose {
-			log.Printf("Writing genesis block with state root: %s", stats.StateRoot.Hex())
-		}
-
-		ancientDir := filepath.Join(config.DBPath, "ancient")
-		block, err := genesis.WriteGenesisBlock(gen.DB(), genesisConfig, stats.StateRoot, config.TrieMode == generator.TrieModeBinary, ancientDir)
-		if err != nil {
-			log.Fatalf("Failed to write genesis block: %v", err)
-		}
-
-		if *verbose {
-			log.Printf("Genesis block hash: %s", block.Hash().Hex())
-			log.Printf("Genesis block number: %d", block.NumberU64())
-		}
+	// Write genesis data directly into each client's database.
+	if *verbose {
+		log.Printf("Writing genesis data with state root: %s", stats.StateRoot.Hex())
+	}
+	if err := gen.Writer().WriteGenesis(genesisConfig, stats.StateRoot, config.TrieMode == generator.TrieModeBinary); err != nil {
+		log.Fatalf("Failed to write genesis: %v", err)
 	}
 
 	elapsed := time.Since(start)
@@ -291,8 +254,13 @@ func main() {
 	fmt.Printf("Throughput:        %.2f slots/sec\n", float64(stats.StorageSlotsCreated)/elapsed.Seconds())
 	fmt.Printf("State Root:        %s\n", stats.StateRoot.Hex())
 
-	if genesisConfig != nil {
-		fmt.Printf("Genesis:           included (ready to use without geth init)\n")
+	switch config.OutputFormat {
+	case generator.OutputGeth:
+		fmt.Printf("Genesis:           written to Pebble DB (no geth init needed)\n")
+	case generator.OutputErigon:
+		fmt.Printf("Genesis:           written to MDBX\n")
+	case generator.OutputNethermind:
+		fmt.Printf("Genesis:           written to MDBX\n")
 	}
 
 	if *benchmark {
@@ -302,10 +270,6 @@ func main() {
 		fmt.Printf("Code Bytes:        %s\n", formatBytes(stats.CodeBytes))
 		fmt.Printf("DB Write Time:     %v\n", stats.DBWriteTime.Round(time.Millisecond))
 		fmt.Printf("Generation Time:   %v\n", stats.GenerationTime.Round(time.Millisecond))
-		if len(config.GenesisAccounts) > 0 {
-			fmt.Printf("Genesis Accounts:  %d\n", len(config.GenesisAccounts))
-		}
-
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 		fmt.Printf("\n=== Memory Stats ===\n")
