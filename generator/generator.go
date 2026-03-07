@@ -19,6 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/holiman/uint256"
@@ -52,6 +53,16 @@ func New(config Config) (*Generator, error) {
 	var err error
 
 	switch config.OutputFormat {
+	case OutputBridge:
+		if config.BridgeBin == "" {
+			return nil, fmt.Errorf("--bridge flag is required when output-format is 'bridge'")
+		}
+		bw, err := NewBridgeWriter(config.BridgeBin, config.BridgeArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to start bridge: %w", err)
+		}
+		writer = bw
+
 	case OutputErigon:
 		// For Erigon, we still need a Pebble DB for binary trie temp storage
 		// and for trie node writes if WriteTrieNodes is enabled
@@ -115,6 +126,12 @@ func (g *Generator) Close() error {
 // DB returns the underlying database for external writes (e.g., genesis block).
 func (g *Generator) DB() ethdb.KeyValueStore {
 	return g.db
+}
+
+// WriteGenesisViaBridge sends genesis config to the bridge process.
+// Only valid when OutputFormat is OutputBridge.
+func (g *Generator) WriteGenesisViaBridge(config *params.ChainConfig, stateRoot common.Hash) error {
+	return g.writer.WriteGenesisBlock(config, stateRoot)
 }
 
 // Generate generates the state and returns statistics.
@@ -303,7 +320,12 @@ func (g *Generator) generateAccountMetas(stats *Stats) ([]*accountMeta, error) {
 // For each account: generate storage → compute storage root → write to DB → discard.
 // This keeps memory bounded by the largest single contract's storage.
 func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) error {
-	accountTrie := trie.NewStackTrie(nil)
+	// In bridge mode, the bridge computes the state root — no local trie needed.
+	isBridge := g.config.OutputFormat == OutputBridge
+	var accountTrie *trie.StackTrie
+	if !isBridge {
+		accountTrie = trie.NewStackTrie(nil)
+	}
 
 	processedCount := 0
 	totalCount := len(metas)
@@ -363,7 +385,10 @@ func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) erro
 
 		// Compute storage root and write storage via StateWriter
 		if len(storageSlots) > 0 {
-			storageTrie := trie.NewStackTrie(nil)
+			var storageTrie *trie.StackTrie
+			if !isBridge {
+				storageTrie = trie.NewStackTrie(nil)
+			}
 
 			// MPT requires keys sorted by Keccak256(key)
 			type keyWithHash struct {
@@ -386,14 +411,18 @@ func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) erro
 					return fmt.Errorf("write storage: %w", err)
 				}
 
-				valueRLP, err := encodeStorageValue(kh.slot.Value)
-				if err != nil {
-					return err
+				if storageTrie != nil {
+					valueRLP, err := encodeStorageValue(kh.slot.Value)
+					if err != nil {
+						return err
+					}
+					storageTrie.Update(kh.keyHash[:], valueRLP)
 				}
-				storageTrie.Update(kh.keyHash[:], valueRLP)
 			}
 
-			stateAccount.Root = storageTrie.Hash()
+			if storageTrie != nil {
+				stateAccount.Root = storageTrie.Hash()
+			}
 		}
 
 		// Write code
@@ -408,9 +437,11 @@ func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) erro
 			return fmt.Errorf("write account: %w", err)
 		}
 
-		// Add to account trie
-		slimData := types.SlimAccountRLP(stateAccount)
-		accountTrie.Update(meta.addrHash[:], slimData)
+		// Add to account trie (skipped in bridge mode)
+		if accountTrie != nil {
+			slimData := types.SlimAccountRLP(stateAccount)
+			accountTrie.Update(meta.addrHash[:], slimData)
+		}
 
 		// Collect sample addresses
 		if meta.isContract {
@@ -443,13 +474,22 @@ func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) erro
 		return fmt.Errorf("flush writes: %w", err)
 	}
 
-	// Compute and store state root
-	stateRoot := accountTrie.Hash()
-	stats.StateRoot = stateRoot
-
-	if err := g.writer.SetStateRoot(stateRoot); err != nil {
-		return fmt.Errorf("failed to write state root: %w", err)
+	// Compute state root
+	var stateRoot common.Hash
+	if bw, ok := g.writer.(*BridgeWriter); ok {
+		// Bridge computes the root from its own trie
+		var err error
+		stateRoot, err = bw.ComputeRoot()
+		if err != nil {
+			return fmt.Errorf("bridge compute root: %w", err)
+		}
+	} else {
+		stateRoot = accountTrie.Hash()
+		if err := g.writer.SetStateRoot(stateRoot); err != nil {
+			return fmt.Errorf("failed to write state root: %w", err)
+		}
 	}
+	stats.StateRoot = stateRoot
 
 	if g.config.Verbose {
 		log.Printf("State root: %s", stateRoot.Hex())

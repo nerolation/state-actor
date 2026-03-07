@@ -15,6 +15,9 @@ const (
 
 	// OutputErigon generates an Erigon-compatible MDBX database (PlainState).
 	OutputErigon OutputFormat = "erigon"
+
+	// OutputBridge delegates all writes to an external bridge process.
+	OutputBridge OutputFormat = "bridge"
 )
 
 // ParseOutputFormat parses an output format string.
@@ -22,6 +25,8 @@ func ParseOutputFormat(s string) OutputFormat {
 	switch s {
 	case "erigon":
 		return OutputErigon
+	case "bridge":
+		return OutputBridge
 	default:
 		return OutputGeth
 	}

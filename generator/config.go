@@ -124,6 +124,14 @@ type Config struct {
 	// Defaults to OutputGeth if empty.
 	OutputFormat OutputFormat
 
+	// BridgeBin is the path to the bridge binary (e.g. "./geth-bridge").
+	// Only used when OutputFormat is OutputBridge.
+	BridgeBin string
+
+	// BridgeArgs are extra arguments passed to the bridge binary
+	// (e.g. "-db", "/path/to/chaindata").
+	BridgeArgs []string
+
 	// LiveStats is an optional live stats tracker for real-time monitoring.
 	// When set, the generator updates stats during generation.
 	LiveStats *LiveStats
