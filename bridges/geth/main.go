@@ -169,13 +169,15 @@ func (b *gethBridge) putAccount(payload []byte) error {
 		return err
 	}
 
-	// Track for root computation
-	b.accounts[address] = &acctRecord{
-		nonce:    nonce,
-		balance:  balance,
-		codeHash: ch,
-		storage:  make(map[common.Hash]common.Hash),
+	// Track for root computation (preserve storage that may have arrived first)
+	rec, ok := b.accounts[address]
+	if !ok {
+		rec = &acctRecord{storage: make(map[common.Hash]common.Hash)}
+		b.accounts[address] = rec
 	}
+	rec.nonce = nonce
+	rec.balance = balance
+	rec.codeHash = ch
 
 	b.batchN++
 	return b.maybeFlushBatch()
@@ -212,10 +214,13 @@ func (b *gethBridge) putStorage(payload []byte) error {
 		return err
 	}
 
-	// Track for root computation
-	if rec, ok := b.accounts[address]; ok {
-		rec.storage[slotHash] = valHash
+	// Track for root computation (storage may arrive before the account)
+	rec, ok := b.accounts[address]
+	if !ok {
+		rec = &acctRecord{storage: make(map[common.Hash]common.Hash)}
+		b.accounts[address] = rec
 	}
+	rec.storage[slotHash] = valHash
 
 	b.batchN++
 	return b.maybeFlushBatch()
@@ -312,12 +317,11 @@ func (b *gethBridge) computeRoot() (common.Hash, error) {
 			CodeHash: rec.codeHash[:],
 		}
 
-		accRLP, err := rlp.EncodeToBytes(acc)
+		data, err := rlp.EncodeToBytes(acc)
 		if err != nil {
-			return common.Hash{}, fmt.Errorf("RLP encode account %s: %w", e.addr.Hex(), err)
+			return common.Hash{}, fmt.Errorf("encode account %s: %w", e.addr.Hex(), err)
 		}
-
-		accountTrie.Update(e.addrHash[:], accRLP)
+		accountTrie.Update(e.addrHash[:], data)
 	}
 
 	root := accountTrie.Hash()

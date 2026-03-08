@@ -128,6 +128,12 @@ func (g *Generator) DB() ethdb.KeyValueStore {
 	return g.db
 }
 
+// BridgeWriter returns the underlying BridgeWriter if the generator is in bridge mode, or nil.
+func (g *Generator) BridgeWriter() *BridgeWriter {
+	bw, _ := g.writer.(*BridgeWriter)
+	return bw
+}
+
 // WriteGenesisViaBridge sends genesis config to the bridge process.
 // Only valid when OutputFormat is OutputBridge.
 func (g *Generator) WriteGenesisViaBridge(config *params.ChainConfig, stateRoot common.Hash) error {
@@ -439,8 +445,11 @@ func (g *Generator) streamWriteStateMPT(metas []*accountMeta, stats *Stats) erro
 
 		// Add to account trie (skipped in bridge mode)
 		if accountTrie != nil {
-			slimData := types.SlimAccountRLP(stateAccount)
-			accountTrie.Update(meta.addrHash[:], slimData)
+			data, err := rlp.EncodeToBytes(&stateAccount)
+			if err != nil {
+				return fmt.Errorf("encode account: %w", err)
+			}
+			accountTrie.Update(meta.addrHash[:], data)
 		}
 
 		// Collect sample addresses
@@ -1401,8 +1410,11 @@ func (g *Generator) writeStateMPT(accounts, contracts []*accountData, stats *Sta
 		}
 
 		// Add to account trie for root computation
-		slimData := types.SlimAccountRLP(*acc.account)
-		accountTrie.Update(acc.addrHash[:], slimData)
+		data, err := rlp.EncodeToBytes(acc.account)
+		if err != nil {
+			return fmt.Errorf("encode account: %w", err)
+		}
+		accountTrie.Update(acc.addrHash[:], data)
 	}
 
 	// Flush all pending writes

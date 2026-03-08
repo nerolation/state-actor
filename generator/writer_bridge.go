@@ -92,8 +92,14 @@ func (w *BridgeWriter) SetStateRoot(_ common.Hash) error {
 	return nil
 }
 
-// WriteGenesisBlock sends genesis config to the bridge and returns the block hash.
+// WriteGenesisBlock sends genesis config to the bridge.
 func (w *BridgeWriter) WriteGenesisBlock(config *params.ChainConfig, stateRoot common.Hash) error {
+	_, err := w.WriteGenesisBlockHash(config, stateRoot)
+	return err
+}
+
+// WriteGenesisBlockHash sends genesis config to the bridge and returns the block hash.
+func (w *BridgeWriter) WriteGenesisBlockHash(config *params.ChainConfig, stateRoot common.Hash) (common.Hash, error) {
 	req := struct {
 		ChainConfig *params.ChainConfig `json:"chainConfig"`
 		StateRoot   common.Hash         `json:"stateRoot"`
@@ -107,13 +113,33 @@ func (w *BridgeWriter) WriteGenesisBlock(config *params.ChainConfig, stateRoot c
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal genesis config: %w", err)
+		return common.Hash{}, fmt.Errorf("marshal genesis config: %w", err)
 	}
 
-	if err := w.sendSync(protocol.CmdWriteGenesis, payload); err != nil {
-		return err
+	if err := w.stdin.Flush(); err != nil {
+		return common.Hash{}, fmt.Errorf("flush stdin: %w", err)
 	}
-	return nil
+	if err := protocol.WriteMsg(w.stdin, protocol.CmdWriteGenesis, payload); err != nil {
+		return common.Hash{}, fmt.Errorf("send WriteGenesis: %w", err)
+	}
+	if err := w.stdin.Flush(); err != nil {
+		return common.Hash{}, fmt.Errorf("flush stdin: %w", err)
+	}
+
+	status, respPayload, err := protocol.ReadResponse(w.stdout)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("read WriteGenesis response: %w", err)
+	}
+	if status != protocol.StatusOK {
+		return common.Hash{}, fmt.Errorf("bridge error: %s", string(respPayload))
+	}
+	if len(respPayload) != 32 {
+		return common.Hash{}, fmt.Errorf("expected 32-byte hash, got %d bytes", len(respPayload))
+	}
+
+	var hash common.Hash
+	copy(hash[:], respPayload)
+	return hash, nil
 }
 
 // Flush sends a Flush command and waits for acknowledgement.
