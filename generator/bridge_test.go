@@ -1,6 +1,7 @@
 package generator
 
 import (
+	"fmt"
 	"math/big"
 	"os"
 	"os/exec"
@@ -168,6 +169,7 @@ func TestBridgeReproducibility(t *testing.T) {
 func TestCrossClientStateRoot(t *testing.T) {
 	gethBin := buildGethBridge(t)
 	erigonBin := buildErigonBridge(t)
+	besuBin := buildBesuBridge(t)
 
 	seed := int64(88888)
 	numAccounts := 20
@@ -187,6 +189,7 @@ func TestCrossClientStateRoot(t *testing.T) {
 	}{
 		{"geth", gethBin},
 		{"erigon", erigonBin},
+		{"besu", besuBin},
 	}
 
 	var results []result
@@ -262,6 +265,7 @@ func TestCrossClientStateRoot(t *testing.T) {
 func TestCrossClientGenesisBlock(t *testing.T) {
 	gethBin := buildGethBridge(t)
 	erigonBin := buildErigonBridge(t)
+	besuBin := buildBesuBridge(t)
 
 	seed := int64(55555)
 
@@ -271,6 +275,7 @@ func TestCrossClientGenesisBlock(t *testing.T) {
 	}{
 		{"geth", gethBin},
 		{"erigon", erigonBin},
+		{"besu", besuBin},
 	}
 
 	type result struct {
@@ -325,18 +330,22 @@ func TestCrossClientGenesisBlock(t *testing.T) {
 		t.Logf("%s: stateRoot=%s blockHash=%s", br.name, stats.StateRoot.Hex(), blockHash.Hex())
 	}
 
-	// State roots must match
-	if results[0].stateRoot != results[1].stateRoot {
-		t.Errorf("state root mismatch:\n  %s: %s\n  %s: %s",
-			results[0].name, results[0].stateRoot.Hex(),
-			results[1].name, results[1].stateRoot.Hex())
+	// All state roots must match
+	for i := 1; i < len(results); i++ {
+		if results[0].stateRoot != results[i].stateRoot {
+			t.Errorf("state root mismatch:\n  %s: %s\n  %s: %s",
+				results[0].name, results[0].stateRoot.Hex(),
+				results[i].name, results[i].stateRoot.Hex())
+		}
 	}
 
-	// Genesis block hashes must match
-	if results[0].blockHash != results[1].blockHash {
-		t.Errorf("genesis block hash mismatch:\n  %s: %s\n  %s: %s",
-			results[0].name, results[0].blockHash.Hex(),
-			results[1].name, results[1].blockHash.Hex())
+	// All genesis block hashes must match
+	for i := 1; i < len(results); i++ {
+		if results[0].blockHash != results[i].blockHash {
+			t.Errorf("genesis block hash mismatch:\n  %s: %s\n  %s: %s",
+				results[0].name, results[0].blockHash.Hex(),
+				results[i].name, results[i].blockHash.Hex())
+		}
 	}
 
 	t.Logf("Cross-client genesis match: stateRoot=%s blockHash=%s",
@@ -400,6 +409,48 @@ func buildErigonBridge(t *testing.T) string {
 	}
 
 	return bridgeBin
+}
+
+// buildBesuBridge builds the besu-bridge fat JAR and returns the path to a
+// wrapper script that can be executed like a native binary.
+// Skips the test if Java/Gradle is not available or build fails.
+func buildBesuBridge(t *testing.T) string {
+	t.Helper()
+
+	projectRoot := findProjectRoot(t)
+	bridgeDir := filepath.Join(projectRoot, "bridges", "besu")
+	clientsDir := filepath.Join(projectRoot, "..", "clients")
+
+	// Find the gradlew from the Besu project
+	gradlew := filepath.Join(clientsDir, "besu", "gradlew")
+	if _, err := os.Stat(gradlew); err != nil {
+		t.Skipf("cannot find besu gradlew: %v", err)
+	}
+
+	// Build the fat JAR
+	cmd := exec.Command(gradlew, "fatJar")
+	cmd.Dir = bridgeDir
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		t.Skipf("cannot build besu-bridge: %v", err)
+	}
+
+	// Find the fat JAR
+	jarPattern := filepath.Join(bridgeDir, "build", "libs", "*-all.jar")
+	jars, err := filepath.Glob(jarPattern)
+	if err != nil || len(jars) == 0 {
+		t.Skipf("cannot find besu-bridge fat JAR at %s", jarPattern)
+	}
+	fatJar := jars[0]
+
+	// Create a wrapper script
+	wrapperPath := filepath.Join(t.TempDir(), "besu-bridge")
+	wrapper := fmt.Sprintf("#!/bin/sh\nexec java -jar %q \"$@\"\n", fatJar)
+	if err := os.WriteFile(wrapperPath, []byte(wrapper), 0755); err != nil {
+		t.Fatalf("write besu-bridge wrapper: %v", err)
+	}
+
+	return wrapperPath
 }
 
 // findProjectRoot walks up from the current directory to find go.mod.
