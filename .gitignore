@@ -52,6 +52,14 @@ temp/
 # Docker
 .docker/
 
+# Bridge binaries
+geth-bridge
+erigon-bridge
+besu-bridge
+
+# Generated data
+data/
+
 # Local config
 .env
 .env.local
