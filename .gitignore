@@ -52,6 +52,19 @@ temp/
 # Docker
 .docker/
 
+# Bridge binaries
+geth-bridge
+erigon-bridge
+besu-bridge
+nethermind-bridge
+
+# .NET build artifacts
+bridges/nethermind/bin/
+bridges/nethermind/obj/
+
+# Generated data
+data/
+
 # Local config
 .env
 .env.local

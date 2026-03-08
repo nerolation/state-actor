@@ -1,0 +1,18 @@
+rootProject.name = 'besu-bridge'
+
+// Include the Besu project as a composite build so we can depend on its modules.
+includeBuild('../../clients/besu') {
+    dependencySubstitution {
+        substitute module('org.hyperledger.besu.internal:core') using project(':ethereum:core')
+        substitute module('org.hyperledger.besu.internal:trie') using project(':ethereum:trie')
+        substitute module('org.hyperledger.besu.internal:rlp') using project(':ethereum:rlp')
+        substitute module('org.hyperledger.besu.internal:kvstore') using project(':services:kvstore')
+        substitute module('org.hyperledger.besu.internal:config') using project(':config')
+        substitute module('org.hyperledger.besu.internal:metrics-core') using project(':metrics:core')
+        substitute module('org.hyperledger.besu.internal:util') using project(':util')
+        substitute module('org.hyperledger.besu:besu-datatypes') using project(':datatypes')
+        substitute module('org.hyperledger.besu:besu-plugin-api') using project(':plugin-api')
+        substitute module('org.hyperledger.besu:besu-evm') using project(':evm')
+        substitute module('org.hyperledger.besu.internal:crypto-algorithms') using project(':crypto:algorithms')
+    }
+}

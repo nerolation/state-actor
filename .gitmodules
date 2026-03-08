@@ -1,0 +1,15 @@
+[submodule "clients/go-ethereum"]
+	path = clients/go-ethereum
+	url = /home/jochem/Documents/work/research/clients/go-ethereum
+[submodule "clients/erigon"]
+	path = clients/erigon
+	url = /home/jochem/Documents/work/research/clients/erigon
+[submodule "clients/nethermind"]
+	path = clients/nethermind
+	url = /home/jochem/Documents/work/research/clients/nethermind
+[submodule "clients/besu"]
+	path = clients/besu
+	url = /home/jochem/Documents/work/research/clients/besu
+[submodule "clients/reth"]
+	path = clients/reth
+	url = /home/jochem/Documents/work/research/clients/reth

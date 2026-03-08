@@ -57,7 +57,10 @@ var (
 	chainID        = flag.Int64("chain-id", 0, "Override genesis chainId (0 = use value from genesis.json)")
 
 	// Output format
-	outputFormat = flag.String("output-format", "geth", "Output database format: 'geth' (Pebble) or 'erigon' (MDBX)")
+	outputFormat = flag.String("output-format", "geth", "Output database format: 'geth', 'erigon', or 'bridge'")
+
+	// Bridge mode
+	bridgeBin = flag.String("bridge", "", "Path to bridge binary (required when output-format=bridge, e.g. ./geth-bridge)")
 
 	// Stats server
 	statsPort = flag.Int("stats-port", 0, "Port for live stats HTTP server (0 = disabled)")
@@ -171,6 +174,8 @@ func main() {
 		InjectAddresses: injectAddrs,
 		TargetSize:      parsedTargetSize,
 		OutputFormat:    generator.ParseOutputFormat(*outputFormat),
+		BridgeBin:       *bridgeBin,
+		BridgeArgs:      []string{"-db", *dbPath},
 		LiveStats:       liveStats,
 	}
 
@@ -261,15 +266,22 @@ func main() {
 			log.Printf("Writing genesis block with state root: %s", stats.StateRoot.Hex())
 		}
 
-		ancientDir := filepath.Join(config.DBPath, "ancient")
-		block, err := genesis.WriteGenesisBlock(gen.DB(), genesisConfig, stats.StateRoot, config.TrieMode == generator.TrieModeBinary, ancientDir)
-		if err != nil {
-			log.Fatalf("Failed to write genesis block: %v", err)
-		}
+		if config.OutputFormat == generator.OutputBridge {
+			// In bridge mode, genesis is written via the bridge protocol
+			if err := gen.WriteGenesisViaBridge(genesisConfig.Config, stats.StateRoot); err != nil {
+				log.Fatalf("Failed to write genesis via bridge: %v", err)
+			}
+		} else {
+			ancientDir := filepath.Join(config.DBPath, "ancient")
+			block, err := genesis.WriteGenesisBlock(gen.DB(), genesisConfig, stats.StateRoot, config.TrieMode == generator.TrieModeBinary, ancientDir)
+			if err != nil {
+				log.Fatalf("Failed to write genesis block: %v", err)
+			}
 
-		if *verbose {
-			log.Printf("Genesis block hash: %s", block.Hash().Hex())
-			log.Printf("Genesis block number: %d", block.NumberU64())
+			if *verbose {
+				log.Printf("Genesis block hash: %s", block.Hash().Hex())
+				log.Printf("Genesis block number: %d", block.NumberU64())
+			}
 		}
 	}
 
