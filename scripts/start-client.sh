@@ -40,6 +40,7 @@ LOG_LEVEL="${LOG_LEVEL:-3}"
 GETH_BIN="${GETH_BIN:-}"
 ERIGON_BIN="${ERIGON_BIN:-}"
 BESU_BIN="${BESU_BIN:-}"
+NETHERMIND_BIN="${NETHERMIND_BIN:-}"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -82,7 +83,7 @@ find_bin() {
 # ============================================================
 if [ $# -eq 0 ]; then
     echo "Usage: $0 <client> [--help]"
-    echo "Clients: geth, erigon, besu"
+    echo "Clients: geth, erigon, besu, nethermind"
     exit 1
 fi
 
@@ -94,7 +95,7 @@ for arg in "$@"; do
         --help|-h)
             show_help
             ;;
-        geth|erigon|besu)
+        geth|erigon|besu|nethermind)
             CLIENT="$arg"
             ;;
         *)
@@ -104,7 +105,7 @@ for arg in "$@"; do
 done
 
 if [ -z "$CLIENT" ]; then
-    die "No client specified. Choose: geth, erigon, besu"
+    die "No client specified. Choose: geth, erigon, besu, nethermind"
 fi
 
 # ============================================================
@@ -122,6 +123,10 @@ case "$CLIENT" in
     besu)
         DB_PATH="$OUTDIR/besu"
         [ -d "$DB_PATH" ] || die "Besu database not found at $DB_PATH. Run generate-state.sh first."
+        ;;
+    nethermind)
+        DB_PATH="$OUTDIR/nethermind"
+        [ -d "$DB_PATH" ] || die "Nethermind database not found at $DB_PATH. Run generate-state.sh first."
         ;;
 esac
 
@@ -221,5 +226,68 @@ case "$CLIENT" in
             --p2p-enabled=false \
             --logging="$BESU_LOG" \
             "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        ;;
+
+    nethermind)
+        nm_dll="$CLIENTS_DIR/nethermind/src/Nethermind/artifacts/bin/Nethermind.Runner/release/nethermind.dll"
+        dotnet_bin="${DOTNET_BIN:-dotnet}"
+
+        # Try native binary first, fall back to dotnet <dll>
+        if [ -n "$NETHERMIND_BIN" ] && [ -x "$NETHERMIND_BIN" ]; then
+            BIN="$NETHERMIND_BIN"
+        elif command -v nethermind &>/dev/null; then
+            BIN=$(command -v nethermind)
+        elif [ -f "$nm_dll" ]; then
+            # Prefer dotnet <dll> — avoids .NET runtime resolution issues
+            BIN="DOTNET_DLL"
+        else
+            die "Nethermind binary not found. Build it or set NETHERMIND_BIN"
+        fi
+
+        log "Starting nethermind from $OUTDIR/nethermind"
+        log "  HTTP-RPC: http://localhost:$HTTP_PORT"
+
+        NETHERMIND_CHAINSPEC="$OUTDIR/nethermind-chainspec.json"
+        [ -f "$NETHERMIND_CHAINSPEC" ] || die "Nethermind chainspec not found at $NETHERMIND_CHAINSPEC"
+
+        # Map numeric log level to Nethermind log levels
+        case "$LOG_LEVEL" in
+            0|1) NM_LOG="ERROR" ;;
+            2)   NM_LOG="WARN" ;;
+            3)   NM_LOG="INFO" ;;
+            4)   NM_LOG="DEBUG" ;;
+            *)   NM_LOG="TRACE" ;;
+        esac
+
+        NM_ARGS=(
+            --data-dir "$OUTDIR/nethermind"
+            --config none
+            --Init.BaseDbPath "$OUTDIR/nethermind/nethermind_db"
+            --Init.ChainSpecPath "$NETHERMIND_CHAINSPEC"
+            --Init.DiscoveryEnabled false
+            --Init.PeerManagerEnabled false
+            --Network.P2PPort "$P2P_PORT"
+            --Network.DiscoveryPort "$P2P_PORT"
+            --JsonRpc.Enabled true
+            --JsonRpc.Host 0.0.0.0
+            --JsonRpc.Port "$HTTP_PORT"
+            --JsonRpc.EnabledModules "[Eth,Web3,Net,Debug,TxPool]"
+            --JsonRpc.WebSocketsPort "$WS_PORT"
+            --JsonRpc.EnginePort "$AUTHRPC_PORT"
+            --JsonRpc.EngineHost 127.0.0.1
+            --JsonRpc.JwtSecretFile "$JWT_SECRET"
+            --HealthChecks.LowStorageSpaceWarningThreshold 0
+            --HealthChecks.LowStorageSpaceShutdownThreshold 0
+            --log "$NM_LOG"
+            "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        )
+
+        if [ "$BIN" = "DOTNET_DLL" ]; then
+            log "  Binary:   $dotnet_bin $nm_dll"
+            exec "$dotnet_bin" "$nm_dll" "${NM_ARGS[@]}"
+        else
+            log "  Binary:   $BIN"
+            exec "$BIN" "${NM_ARGS[@]}"
+        fi
         ;;
 esac

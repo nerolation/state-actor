@@ -41,7 +41,7 @@ CHAIN_ID="${CHAIN_ID:-1337}"
 INJECT="${INJECT:-}"
 
 # All supported clients
-ALL_CLIENTS="geth erigon besu"
+ALL_CLIENTS="geth erigon besu nethermind"
 
 # Parse arguments
 SELECTED_CLIENTS=()
@@ -58,12 +58,12 @@ for arg in "$@"; do
         --verify)
             VERIFY=true
             ;;
-        geth|erigon|besu)
+        geth|erigon|besu|nethermind)
             SELECTED_CLIENTS+=("$arg")
             ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: $0 [--verify] [geth] [erigon] [besu]"
+            echo "Usage: $0 [--verify] [geth] [erigon] [besu] [nethermind]"
             exit 1
             ;;
     esac
@@ -113,11 +113,28 @@ WRAPPER
     chmod +x "$ROOT_DIR/besu-bridge"
 }
 
+build_nethermind_bridge() {
+    log "Building nethermind-bridge..."
+    local dotnet="${DOTNET_BIN:-dotnet}"
+    (cd "$ROOT_DIR/bridges/nethermind" && "$dotnet" build -c Release --verbosity minimal)
+    local dll="$ROOT_DIR/bridges/nethermind/bin/Release/net10.0/NethermindBridge.dll"
+    if [ ! -f "$dll" ]; then
+        die "nethermind-bridge DLL not found after build"
+    fi
+    # Create wrapper script
+    cat > "$ROOT_DIR/nethermind-bridge" << WRAPPER
+#!/bin/sh
+exec "$dotnet" "$dll" "\$@"
+WRAPPER
+    chmod +x "$ROOT_DIR/nethermind-bridge"
+}
+
 for client in "${SELECTED_CLIENTS[@]}"; do
     case "$client" in
-        geth)   build_geth_bridge ;;
-        erigon) build_erigon_bridge ;;
-        besu)   build_besu_bridge ;;
+        geth)       build_geth_bridge ;;
+        erigon)     build_erigon_bridge ;;
+        besu)       build_besu_bridge ;;
+        nethermind) build_nethermind_bridge ;;
     esac
 done
 
@@ -174,6 +191,90 @@ if [ -z "$GENESIS" ]; then
 }
 EOF
     log "Wrote $GENESIS"
+
+    # Generate Nethermind chainspec (Parity-style) if nethermind is selected
+    for c in "${SELECTED_CLIENTS[@]}"; do
+        if [ "$c" = "nethermind" ]; then
+            NETHERMIND_CHAINSPEC="$OUTDIR/nethermind-chainspec.json"
+            CHAIN_ID_HEX=$(printf "0x%x" "$CHAIN_ID")
+            cat > "$NETHERMIND_CHAINSPEC" << NMEOF
+{
+  "name": "StateActor",
+  "dataDir": "stateactor",
+  "engine": {
+    "Ethash": {}
+  },
+  "params": {
+    "gasLimitBoundDivisor": "0x400",
+    "accountStartNonce": "0x0",
+    "maximumExtraDataSize": "0xffff",
+    "minGasLimit": "0x1388",
+    "chainID": "$CHAIN_ID_HEX",
+    "networkID": "$CHAIN_ID_HEX",
+    "maxCodeSize": "0x6000",
+    "maxCodeSizeTransition": "0x0",
+    "eip150Transition": "0x0",
+    "eip158Transition": "0x0",
+    "eip160Transition": "0x0",
+    "eip161abcTransition": "0x0",
+    "eip161dTransition": "0x0",
+    "eip155Transition": "0x0",
+    "eip140Transition": "0x0",
+    "eip211Transition": "0x0",
+    "eip214Transition": "0x0",
+    "eip658Transition": "0x0",
+    "eip145Transition": "0x0",
+    "eip1014Transition": "0x0",
+    "eip1052Transition": "0x0",
+    "eip1283Transition": "0x0",
+    "eip1283DisableTransition": "0x0",
+    "eip152Transition": "0x0",
+    "eip1108Transition": "0x0",
+    "eip1344Transition": "0x0",
+    "eip1884Transition": "0x0",
+    "eip2028Transition": "0x0",
+    "eip2200Transition": "0x0",
+    "eip2565Transition": "0x0",
+    "eip2929Transition": "0x0",
+    "eip2930Transition": "0x0",
+    "eip1559Transition": "0x0",
+    "eip3198Transition": "0x0",
+    "eip3529Transition": "0x0",
+    "eip3541Transition": "0x0",
+    "MergeForkIdTransition": "0x0",
+    "terminalTotalDifficulty": "0x0",
+    "eip4895TransitionTimestamp": "0x0",
+    "eip3855TransitionTimestamp": "0x0",
+    "eip3651TransitionTimestamp": "0x0",
+    "eip3860TransitionTimestamp": "0x0",
+    "eip4844TransitionTimestamp": "0x0",
+    "eip4788TransitionTimestamp": "0x0",
+    "eip1153TransitionTimestamp": "0x0",
+    "eip5656TransitionTimestamp": "0x0",
+    "eip6780TransitionTimestamp": "0x0"
+  },
+  "genesis": {
+    "seal": {
+      "ethereum": {
+        "nonce": "0x0",
+        "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "difficulty": "0x0",
+    "author": "0x0000000000000000000000000000000000000000",
+    "timestamp": "0x0",
+    "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "extraData": "",
+    "gasLimit": "0x1c9c380",
+    "baseFeePerGas": "0x3b9aca00"
+  },
+  "accounts": {}
+}
+NMEOF
+            log "Wrote $NETHERMIND_CHAINSPEC"
+            break
+        fi
+    done
 fi
 
 # ============================================================
@@ -185,9 +286,10 @@ generate_client() {
     local db_path
 
     case "$client" in
-        geth)   db_path="$OUTDIR/geth/geth/chaindata" ;;
-        erigon) db_path="$OUTDIR/erigon" ;;
-        besu)   db_path="$OUTDIR/besu" ;;
+        geth)       db_path="$OUTDIR/geth/geth/chaindata" ;;
+        erigon)     db_path="$OUTDIR/erigon" ;;
+        besu)       db_path="$OUTDIR/besu" ;;
+        nethermind) db_path="$OUTDIR/nethermind/nethermind_db" ;;
     esac
 
     rm -rf "$db_path"
@@ -338,9 +440,10 @@ echo "  Done! Client databases are in $OUTDIR/"
 echo "=========================================="
 for client in "${SELECTED_CLIENTS[@]}"; do
     case "$client" in
-        geth)   echo "  geth:   $OUTDIR/geth/geth/chaindata" ;;
-        erigon) echo "  erigon: $OUTDIR/erigon" ;;
-        besu)   echo "  besu:   $OUTDIR/besu" ;;
+        geth)       echo "  geth:       $OUTDIR/geth/geth/chaindata" ;;
+        erigon)     echo "  erigon:     $OUTDIR/erigon" ;;
+        besu)       echo "  besu:       $OUTDIR/besu" ;;
+        nethermind) echo "  nethermind: $OUTDIR/nethermind/nethermind_db" ;;
     esac
 done
 echo ""

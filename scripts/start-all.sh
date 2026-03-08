@@ -15,10 +15,11 @@
 #   LOG_LEVEL     Log verbosity                           (default: 3 / INFO)
 #
 # Port assignments:
-#   Client   HTTP    WS      Engine  P2P
-#   geth     8545    8546    8551    30303
-#   erigon   8645    8646    8651    30403
-#   besu     8745    8746    8751    30503
+#   Client      HTTP    WS      Engine  P2P
+#   geth        8545    8546    8551    30303
+#   erigon      8645    8646    8651    30403
+#   besu        8745    8746    8751    30503
+#   nethermind  8845    8846    8851    30603
 
 set -euo pipefail
 
@@ -118,22 +119,24 @@ echo "  Starting all clients"
 echo "=========================================="
 echo ""
 
-#              client   HTTP   WS     Engine P2P
-start_client   geth     8545   8546   8551   30303
-start_client   erigon   8645   8646   8651   30403
-start_client   besu     8745   8746   8751   30503
+#              client      HTTP   WS     Engine P2P
+start_client   geth        8545   8546   8551   30303
+start_client   erigon      8645   8646   8651   30403
+start_client   besu        8745   8746   8751   30503
+start_client   nethermind  8845   8846   8851   30603
 
 echo ""
 echo "=========================================="
 echo "  All clients running"
 echo "=========================================="
 echo ""
-echo "  geth:    http://localhost:8545    (log: $OUTDIR/geth.log)"
-echo "  erigon:  http://localhost:8645    (log: $OUTDIR/erigon.log)"
-echo "  besu:    http://localhost:8745    (log: $OUTDIR/besu.log)"
+echo "  geth:       http://localhost:8545    (log: $OUTDIR/geth.log)"
+echo "  erigon:     http://localhost:8645    (log: $OUTDIR/erigon.log)"
+echo "  besu:       http://localhost:8745    (log: $OUTDIR/besu.log)"
+echo "  nethermind: http://localhost:8845    (log: $OUTDIR/nethermind.log)"
 echo ""
 echo "  Verify state roots match:"
-echo "    for port in 8545 8645 8745; do"
+echo "    for port in 8545 8645 8745 8845; do"
 echo "      curl -s http://localhost:\$port -X POST \\"
 echo "        -H 'Content-Type: application/json' \\"
 echo "        -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_getBlockByNumber\",\"params\":[\"0x0\",false],\"id\":1}' \\"
