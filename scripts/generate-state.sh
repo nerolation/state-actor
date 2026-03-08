@@ -184,7 +184,7 @@ generate_client() {
     local db_path
 
     case "$client" in
-        geth)   db_path="$OUTDIR/geth/chaindata" ;;
+        geth)   db_path="$OUTDIR/geth/geth/chaindata" ;;
         erigon) db_path="$OUTDIR/erigon" ;;
         besu)   db_path="$OUTDIR/besu" ;;
     esac
@@ -337,7 +337,7 @@ echo "  Done! Client databases are in $OUTDIR/"
 echo "=========================================="
 for client in "${SELECTED_CLIENTS[@]}"; do
     case "$client" in
-        geth)   echo "  geth:   $OUTDIR/geth/chaindata" ;;
+        geth)   echo "  geth:   $OUTDIR/geth/geth/chaindata" ;;
         erigon) echo "  erigon: $OUTDIR/erigon" ;;
         besu)   echo "  besu:   $OUTDIR/besu" ;;
     esac

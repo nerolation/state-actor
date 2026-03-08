@@ -465,13 +465,24 @@ func writeChainConfigCompat(db ethdb.KeyValueWriter, hash common.Hash, cfg *para
 	if err != nil {
 		return
 	}
-	if cfg.TerminalTotalDifficulty != nil && cfg.TerminalTotalDifficulty.Sign() == 0 {
-		var raw map[string]json.RawMessage
-		if json.Unmarshal(data, &raw) == nil {
+	// Patch the JSON to add fields needed by newer geth versions (1.17+).
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(data, &raw) == nil {
+		if cfg.TerminalTotalDifficulty != nil && cfg.TerminalTotalDifficulty.Sign() == 0 {
 			raw["terminalTotalDifficultyPassed"] = json.RawMessage("true")
-			if d, err := json.Marshal(raw); err == nil {
-				data = d
+		}
+		// geth 1.17+ requires blobSchedule when cancunTime is set, otherwise
+		// ChainConfig.Description() dereferences nil BlobScheduleConfig.
+		if _, ok := raw["blobSchedule"]; !ok {
+			if _, hasCancun := raw["cancunTime"]; hasCancun {
+				raw["blobSchedule"] = json.RawMessage(`{
+					"cancun":{"target":3,"max":6,"baseFeeUpdateFraction":3338477},
+					"prague":{"target":6,"max":9,"baseFeeUpdateFraction":5007716}
+				}`)
 			}
+		}
+		if d, err := json.Marshal(raw); err == nil {
+			data = d
 		}
 	}
 	key := append([]byte("ethereum-config-"), hash.Bytes()...)

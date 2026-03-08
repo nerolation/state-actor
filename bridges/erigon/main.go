@@ -11,7 +11,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -185,10 +184,8 @@ func (b *erigonBridge) putCode(payload []byte) error {
 	return nil
 }
 
-// computeRoot builds a Genesis.Alloc from buffered state and uses Erigon's
-// commitment computation (hex patricia hashed trie) to compute the state root.
-func (b *erigonBridge) computeRoot() (common.Hash, error) {
-	// Build Genesis.Alloc from buffered state
+// buildAlloc constructs a types.GenesisAlloc from the buffered state.
+func (b *erigonBridge) buildAlloc() types.GenesisAlloc {
 	alloc := make(types.GenesisAlloc, len(b.accounts))
 	for addr, rec := range b.accounts {
 		ga := types.GenesisAccount{
@@ -206,6 +203,15 @@ func (b *erigonBridge) computeRoot() (common.Hash, error) {
 		}
 		alloc[addr] = ga
 	}
+	return alloc
+}
+
+// computeRoot builds a Genesis.Alloc from buffered state and uses Erigon's
+// commitment computation (hex patricia hashed trie) to compute the state root.
+// This uses a temporary in-memory MDBX — state is NOT persisted here.
+// Persistent state is written later in writeGenesis() via CommitGenesisBlock.
+func (b *erigonBridge) computeRoot() (common.Hash, error) {
+	alloc := b.buildAlloc()
 
 	// Use a minimal genesis config for root computation.
 	// Chain config does NOT affect the state root — it only affects block header fields.
@@ -219,9 +225,6 @@ func (b *erigonBridge) computeRoot() (common.Hash, error) {
 	dirs := datadir.New(b.datadir)
 	logger := erigonlog.New()
 
-	// WriteGenesisState computes the state root using Erigon's commitment
-	// (hex patricia hashed trie) via a temporary in-memory MDBX.
-	// No persistent state is written — only the root is computed.
 	block, _, err := genesiswrite.WriteGenesisState(g, dirs, logger)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("compute root: %w", err)
@@ -232,7 +235,9 @@ func (b *erigonBridge) computeRoot() (common.Hash, error) {
 	return root, nil
 }
 
-// writeGenesis writes the genesis block and chain metadata to Erigon's MDBX.
+// writeGenesis writes the full genesis state and block metadata to Erigon's MDBX.
+// This uses CommitGenesisBlock which persists both state (domain files) and
+// block/config metadata to the chaindata MDBX — producing a bootable database.
 func (b *erigonBridge) writeGenesis(payload []byte) (common.Hash, error) {
 	// Parse the genesis request
 	var req struct {
@@ -252,13 +257,13 @@ func (b *erigonBridge) writeGenesis(payload []byte) (common.Hash, error) {
 		return common.Hash{}, fmt.Errorf("unmarshal chain config: %w", err)
 	}
 
-	// Build genesis struct (empty alloc — state root was already computed)
+	// Build full genesis with alloc from buffered state
 	g := &types.Genesis{
 		Config:     &cfg,
 		GasLimit:   req.GasLimit,
 		Difficulty: new(uint256.Int),
 		Timestamp:  req.Timestamp,
-		Alloc:      make(types.GenesisAlloc),
+		Alloc:      b.buildAlloc(),
 	}
 	if cfg.IsLondon(0) {
 		if req.BaseFee > 0 {
@@ -268,33 +273,25 @@ func (b *erigonBridge) writeGenesis(payload []byte) (common.Hash, error) {
 		}
 	}
 
-	// Build the genesis header and set the pre-computed state root
-	head, withdrawals := genesiswrite.GenesisWithoutStateToBlock(g)
-	head.Root = req.StateRoot
-
-	block := types.NewBlock(head, nil, nil, nil, withdrawals)
-
-	// Open MDBX and write genesis block metadata
+	// CommitGenesisBlock writes both state (domain files in dirs.SnapDomain)
+	// and block metadata (chaindata MDBX). This is the same path as `erigon init`.
 	dirs := datadir.New(b.datadir)
 	logger := erigonlog.New()
 	db := mdbx.New(dbcfg.ChainDB, logger).Path(dirs.Chaindata).MustOpen()
 	defer db.Close()
 
-	tx, err := db.BeginRw(context.Background())
+	_, block, err := genesiswrite.CommitGenesisBlock(db, g, dirs, logger)
 	if err != nil {
-		return common.Hash{}, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	if err := genesiswrite.WriteGenesisBesideState(block, tx, g); err != nil {
-		return common.Hash{}, fmt.Errorf("write genesis: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
 		return common.Hash{}, fmt.Errorf("commit genesis: %w", err)
 	}
 
-	log.Printf("wrote genesis block %s", block.Hash().Hex())
+	// Verify the state root matches what we computed earlier
+	if block.Root() != req.StateRoot {
+		log.Printf("WARNING: state root mismatch: computed=%s committed=%s",
+			req.StateRoot.Hex(), block.Root().Hex())
+	}
+
+	log.Printf("wrote genesis block %s (stateRoot=%s)", block.Hash().Hex(), block.Root().Hex())
 	return block.Hash(), nil
 }
 

@@ -112,7 +112,7 @@ fi
 # ============================================================
 case "$CLIENT" in
     geth)
-        DB_PATH="$OUTDIR/geth/chaindata"
+        DB_PATH="$OUTDIR/geth/geth/chaindata"
         [ -d "$DB_PATH" ] || die "Geth database not found at $DB_PATH. Run generate-state.sh first."
         ;;
     erigon)
@@ -148,6 +148,7 @@ case "$CLIENT" in
 
         exec "$BIN" \
             --datadir "$OUTDIR/geth" \
+            --state.scheme hash \
             --networkid "$CHAIN_ID" \
             --http --http.addr 0.0.0.0 --http.port "$HTTP_PORT" \
             --http.api eth,web3,net,debug,txpool \

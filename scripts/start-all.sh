@@ -109,6 +109,7 @@ start_client() {
     local pid=$!
     PIDS+=("$pid")
     NAMES+=("$client")
+    log "CLIENT" $client "FOLDER" outdir
     log "Started $client (pid $pid) → HTTP :$http_port  WS :$ws_port  Engine :$authrpc_port"
 }
 
