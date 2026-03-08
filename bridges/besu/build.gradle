@@ -41,6 +41,9 @@ dependencies {
     implementation 'io.consensys.tuweni:tuweni-bytes'
     implementation 'io.consensys.tuweni:tuweni-units'
 
+    // RocksDB for persistent storage
+    implementation 'org.rocksdb:rocksdbjni:9.7.3'
+
     // SLF4J + simple logger for stderr output
     implementation 'org.slf4j:slf4j-api'
     runtimeOnly 'org.slf4j:slf4j-simple'

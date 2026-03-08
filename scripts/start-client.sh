@@ -208,6 +208,8 @@ case "$CLIENT" in
             --data-path "$OUTDIR/besu" \
             --genesis-file "$GENESIS" \
             --network-id "$CHAIN_ID" \
+            --data-storage-format=FOREST \
+            --genesis-state-hash-cache-enabled=true \
             --rpc-http-enabled --rpc-http-host 0.0.0.0 --rpc-http-port "$HTTP_PORT" \
             --rpc-http-api ETH,WEB3,NET,DEBUG,TXPOOL \
             --rpc-http-cors-origins="*" \

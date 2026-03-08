@@ -161,7 +161,8 @@ if [ -z "$GENESIS" ]; then
     "shanghaiTime": 0,
     "cancunTime": 0,
     "terminalTotalDifficulty": 0,
-    "terminalTotalDifficultyPassed": true
+    "terminalTotalDifficultyPassed": true,
+    "ethash": {}
   },
   "nonce": "0x0",
   "timestamp": "0x0",
