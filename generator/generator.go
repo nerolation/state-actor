@@ -880,7 +880,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		nodeDB = g.db
 	}
 	iter := tempDB.NewIterator(nil, nil)
-	stateRoot, tnStats := computeBinaryRootStreaming(iter, nodeDB)
+	stateRoot, tnStats := computeBinaryRootStreaming(iter, nodeDB, g.config.GroupDepth)
 	if g.config.Verbose {
 		log.Printf("Computed binary trie root in %v", time.Since(hashStart).Round(time.Millisecond))
 	}
