@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"log"
 	"math/bits"
+	"sort"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -21,7 +22,16 @@ const (
 	// Node type markers matching bintrie/binary_node.go
 	nodeTypeStem     = 1
 	nodeTypeInternal = 2
+
+	// maxGroupDepth is the maximum allowed group depth for grouped serialization.
+	maxGroupDepth = 8
 )
+
+// bitmapSizeForDepth returns the number of bytes needed for a bitmap of
+// 2^groupDepth bits (one bit per bottom-layer child slot in a grouped node).
+func bitmapSizeForDepth(groupDepth int) int {
+	return (1 << groupDepth) / 8
+}
 
 // verkleTrieNodeKeyPrefix is the database key prefix for binary trie nodes.
 // PathDB isolates binary trie data under a "v" namespace prefix
@@ -34,6 +44,14 @@ var verkleTrieNodeKeyPrefix = []byte("vA")
 type trieEntry struct {
 	Key   [hashSize]byte
 	Value [hashSize]byte
+}
+
+// groupChild records a bottom-layer child hash within a grouped InternalNode.
+// slot is the position (0 to 2^groupDepth - 1) determined by the stem bits
+// between the group boundary and the bottom layer.
+type groupChild struct {
+	slot int
+	hash common.Hash
 }
 
 // trieNodeWriter batches serialized trie node writes to Pebble.
@@ -81,6 +99,27 @@ func serializeInternalNode(leftHash, rightHash common.Hash) []byte {
 	return buf[:]
 }
 
+// serializeGroupedInternalNode serializes a grouped InternalNode matching
+// geth's grouped format: [type=2][groupDepth][bitmap][present hashes...].
+// The bitmap has 2^groupDepth bits indicating which bottom-layer children
+// are present. Only present children's hashes are packed after the bitmap.
+func serializeGroupedInternalNode(groupDepth int, children []groupChild) []byte {
+	bitmapSize := bitmapSizeForDepth(groupDepth)
+	size := 1 + 1 + bitmapSize + len(children)*hashSize
+	buf := make([]byte, size)
+	buf[0] = nodeTypeInternal
+	buf[1] = byte(groupDepth)
+	for _, c := range children {
+		buf[2+c.slot/8] |= 1 << (7 - (c.slot % 8))
+	}
+	offset := 2 + bitmapSize
+	for _, c := range children {
+		copy(buf[offset:offset+hashSize], c.hash[:])
+		offset += hashSize
+	}
+	return buf
+}
+
 // serializeStemNode serializes a StemNode to the format expected by
 // bintrie.DeserializeNode:
 //
@@ -119,43 +158,29 @@ func serializeStemNode(stem []byte, entries []trieEntry) []byte {
 //  1. Hash each value: data[suffix] = SHA256(value)
 //  2. 8-level tree reduction: data[i] = SHA256(data[2i] || data[2i+1]), skip if both zero
 //  3. Final: SHA256(stem || 0x00 || data[0])
-//
-// Uses a [4]uint64 bitmap to skip zero pairs in the tree reduction.
-// For a typical StemNode with k=2 entries, this reduces iterations from
-// 255 (with 32-byte comparisons) to ~16 (with single-bit tests).
 func computeStemNodeHash(stem []byte, entries []trieEntry) common.Hash {
 	var data [stemNodeWidth]common.Hash
-	var bm [4]uint64 // 256-bit bitmap: bit set = data[i] is non-zero
+	var zeroHash common.Hash
 
-	// Step 1: Hash each value at its suffix position, mark bitmap
+	// Step 1: Hash each value at its suffix position
 	for _, e := range entries {
 		suffix := e.Key[stemSize] // key[31]
 		data[suffix] = sha256.Sum256(e.Value[:])
-		bm[suffix/64] |= 1 << (63 - uint(suffix)%64)
 	}
 
-	// Step 2: 8-level tree reduction — skip zero pairs via bitmap.
-	// The reduction is in-place (writes data[i] from data[2i],data[2i+1]),
-	// so we must explicitly zero data[i] when skipping to avoid stale values
-	// from Step 1 or previous levels.
+	// Step 2: 8-level tree reduction (matching StemNode.Hash exactly)
 	var buf [64]byte
 	for level := 1; level <= 8; level++ {
 		count := stemNodeWidth / (1 << level)
-		var newBm [4]uint64
 		for i := 0; i < count; i++ {
-			li, ri := i*2, i*2+1
-			lSet := bm[li/64]&(1<<(63-uint(li)%64)) != 0
-			rSet := bm[ri/64]&(1<<(63-uint(ri)%64)) != 0
-			if !lSet && !rSet {
-				data[i] = common.Hash{} // clear stale data from earlier levels
+			if data[i*2] == zeroHash && data[i*2+1] == zeroHash {
+				data[i] = zeroHash
 				continue
 			}
-			copy(buf[:32], data[li][:])
-			copy(buf[32:], data[ri][:])
+			copy(buf[:32], data[i*2][:])
+			copy(buf[32:], data[i*2+1][:])
 			data[i] = sha256.Sum256(buf[:])
-			newBm[i/64] |= 1 << (63 - uint(i)%64)
 		}
-		bm = newBm
 	}
 
 	// Step 3: Final hash = SHA256(stem || 0x00 || data[0])
@@ -296,13 +321,24 @@ func commonPrefixLenBits(a, b []byte) int {
 // right) of its parent it belongs to, using the stem bits at each depth.
 // This ensures H(left, right) ordering matches the recursive tree exactly,
 // even when all entries go right at some depth (making left = zero).
+//
+// When groupDepth > 0, the builder emits grouped-format InternalNodes
+// directly at group boundary depths (depth % groupDepth == 0), skipping
+// writes at intermediate depths. Stems within a group are extended to the
+// group's bottom-layer boundary. This eliminates the need for a post-hoc
+// regroupTrieNodes pass. Memory overhead: O(groupDepth) per group.
 type streamingBuilder struct {
 	stack    [maxDepth]common.Hash      // pending child hash at each depth
 	occupied [maxDepth]bool             // whether stack[d] is valid
 	isRight  [maxDepth]bool             // true if stack[d] is a right child
 	stemBits [maxDepth][stemSize]byte   // stem that placed each pending hash
 	w        *trieNodeWriter            // optional: writes serialized nodes to DB
-	pathBuf  [maxDepth]byte             // reusable buffer for buildPath
+
+	// Grouped emission: when groupDepth > 0, internal nodes are written in
+	// grouped format at boundary depths. groupBuf collects bottom-layer
+	// children for each active group boundary.
+	groupDepth int
+	groupBuf   map[int][]groupChild // boundary depth -> bottom-layer children
 
 	// Deferred stem: waiting for right-neighbor CPL before placement.
 	hasPrev     bool
@@ -310,16 +346,6 @@ type streamingBuilder struct {
 	prevStem    [stemSize]byte
 	prevLeftCPL int         // CPL with left neighbor (-1 if first stem)
 	prevEntries []trieEntry // kept only when w != nil (for serialization)
-}
-
-// buildPath writes the bit-path from root to `depth` into sb.pathBuf and
-// returns a sub-slice. The returned slice is only valid until the next
-// buildPath call. Safe because Pebble batch.Put() copies key/value internally.
-func (sb *streamingBuilder) buildPath(stem []byte, depth int) []byte {
-	for i := 0; i < depth; i++ {
-		sb.pathBuf[i] = stemBitAt(stem, i)
-	}
-	return sb.pathBuf[:depth]
 }
 
 // stemBitAt returns the bit value (0 or 1) at the given depth in a stem.
@@ -335,6 +361,39 @@ func makePath(stem []byte, depth int) []byte {
 		path[i] = stemBitAt(stem, i)
 	}
 	return path
+}
+
+// recordGroupChild records a hash at a boundary depth as a bottom-layer
+// child of the parent group. The slot (0 to 2^groupDepth - 1) is computed
+// from the stem bits between the parent boundary and the child depth.
+func (sb *streamingBuilder) recordGroupChild(childDepth int, hash common.Hash, stem []byte) {
+	parentBoundary := childDepth - sb.groupDepth
+	if parentBoundary < 0 {
+		return
+	}
+	gd := sb.groupDepth
+	slot := 0
+	for i := 0; i < gd; i++ {
+		slot = (slot << 1) | int(stemBitAt(stem, parentBoundary+i))
+	}
+	sb.groupBuf[parentBoundary] = append(sb.groupBuf[parentBoundary], groupChild{slot: slot, hash: hash})
+}
+
+// writeGroupedNode serializes and writes a grouped InternalNode at the
+// given boundary depth using collected bottom-layer children.
+func (sb *streamingBuilder) writeGroupedNode(boundary int, stem []byte) {
+	children := sb.groupBuf[boundary]
+	if len(children) == 0 {
+		return
+	}
+	// Sort by slot to ensure hashes are in bitmap order.
+	sort.Slice(children, func(i, j int) bool {
+		return children[i].slot < children[j].slot
+	})
+	blob := serializeGroupedInternalNode(sb.groupDepth, children)
+	sb.w.writeNode(makePath(stem, boundary), blob)
+	// Reset buffer for this boundary depth after writing.
+	sb.groupBuf[boundary] = children[:0]
 }
 
 // feedStem is called for each completed stem group (consecutive entries
@@ -360,6 +419,9 @@ func (sb *streamingBuilder) feedStem(stem []byte, hash common.Hash, entries []tr
 }
 
 // flushDeferred places the previously deferred StemNode at the correct depth.
+// When groupDepth > 0, the target depth is extended to the next group
+// bottom-layer boundary so that stems within a group are stored at the
+// extended path (matching the grouped serialization format).
 func (sb *streamingBuilder) flushDeferred(rightCPL int) {
 	targetDepth := sb.prevLeftCPL
 	if rightCPL > targetDepth {
@@ -367,13 +429,22 @@ func (sb *streamingBuilder) flushDeferred(rightCPL int) {
 	}
 	targetDepth++ // StemNode sits one level below the divergence point
 
+	// Extend stem depth to group bottom-layer boundary if within a group.
+	if sb.groupDepth > 0 {
+		gd := sb.groupDepth
+		boundary := (targetDepth / gd) * gd
+		if targetDepth > boundary {
+			targetDepth = boundary + gd
+		}
+	}
+
 	// Resolve pending hashes from the PREVIOUS subtree. Any pending hashes
 	// at depths > prevLeftCPL belong to the left neighbor's subtree.
 	sb.unwindTo(sb.prevLeftCPL + 1)
 
 	// Write the StemNode — path derived from the stem being placed.
 	if sb.w != nil {
-		sb.w.writeNode(sb.buildPath(sb.prevStem[:], targetDepth), serializeStemNode(sb.prevStem[:], sb.prevEntries))
+		sb.w.writeNode(makePath(sb.prevStem[:], targetDepth), serializeStemNode(sb.prevStem[:], sb.prevEntries))
 	}
 
 	sb.propagateUp(sb.prevHash, targetDepth, sb.prevStem[:])
@@ -400,8 +471,16 @@ func (sb *streamingBuilder) unwindTo(minDepth int) {
 		combined := sha256.Sum256(buf[:])
 
 		if sb.w != nil {
-			// Path derived from the stem that placed this pending hash.
-			sb.w.writeNode(sb.buildPath(sb.stemBits[d][:], d), serializeInternalNode(left, right))
+			if sb.groupDepth > 0 {
+				// At group boundaries: write grouped node using collected children.
+				// At non-boundary depths: skip write (hash still propagates).
+				if d%sb.groupDepth == 0 {
+					sb.writeGroupedNode(d, sb.stemBits[d][:])
+				}
+			} else {
+				// Path derived from the stem that placed this pending hash.
+				sb.w.writeNode(makePath(sb.stemBits[d][:], d), serializeInternalNode(left, right))
+			}
 		}
 		// Propagate upward using the stem that originally placed this hash.
 		stem := sb.stemBits[d]
@@ -413,9 +492,21 @@ func (sb *streamingBuilder) unwindTo(minDepth int) {
 // propagateUp pushes a hash from fromDepth toward the root. Uses the stem's
 // bit at each depth to determine whether the hash is a left or right child.
 // When the hash is right and no left exists, it combines with zero immediately.
+//
+// When groupDepth > 0, at each group boundary depth the hash is recorded as
+// a bottom-layer child of the parent group. DB writes are only emitted at
+// boundary depths (grouped format); non-boundary writes are skipped.
 func (sb *streamingBuilder) propagateUp(hash common.Hash, fromDepth int, stem []byte) {
 	for d := fromDepth; d > 0; d-- {
 		pd := d - 1
+
+		// Record bottom-layer child at group boundary depths.
+		// A hash at depth d (where d % groupDepth == 0) is a bottom-layer
+		// child of the parent group at depth d - groupDepth.
+		if sb.groupDepth > 0 && d%sb.groupDepth == 0 && d >= sb.groupDepth {
+			sb.recordGroupChild(d, hash, stem)
+		}
+
 		bit := stemBitAt(stem, pd)
 
 		if sb.occupied[pd] {
@@ -436,8 +527,14 @@ func (sb *streamingBuilder) propagateUp(hash common.Hash, fromDepth int, stem []
 			hash = sha256.Sum256(buf[:])
 
 			if sb.w != nil {
-				// Path derived from stem — both children share bits 0..pd-1.
-				sb.w.writeNode(sb.buildPath(stem, pd), serializeInternalNode(left, right))
+				if sb.groupDepth > 0 {
+					if pd%sb.groupDepth == 0 {
+						sb.writeGroupedNode(pd, stem)
+					}
+				} else {
+					// Path derived from stem — both children share bits 0..pd-1.
+					sb.w.writeNode(makePath(stem, pd), serializeInternalNode(left, right))
+				}
 			}
 			sb.occupied[pd] = false
 		} else if bit == 1 {
@@ -450,7 +547,13 @@ func (sb *streamingBuilder) propagateUp(hash common.Hash, fromDepth int, stem []
 			hash = sha256.Sum256(buf[:])
 
 			if sb.w != nil {
-				sb.w.writeNode(sb.buildPath(stem, pd), serializeInternalNode(common.Hash{}, right))
+				if sb.groupDepth > 0 {
+					if pd%sb.groupDepth == 0 {
+						sb.writeGroupedNode(pd, stem)
+					}
+				} else {
+					sb.w.writeNode(makePath(stem, pd), serializeInternalNode(common.Hash{}, right))
+				}
 			}
 			// Continue propagating upward — don't store.
 		} else {
@@ -485,11 +588,16 @@ type trieNodeStats struct {
 // computeBinaryRootStreamingFromSlice is the slice-based variant used for
 // testing equivalence with the recursive approach. It feeds pre-sorted
 // entries directly into the streaming builder without needing a DB iterator.
-func computeBinaryRootStreamingFromSlice(entries []trieEntry, db ethdb.KeyValueStore) (common.Hash, trieNodeStats) {
+func computeBinaryRootStreamingFromSlice(entries []trieEntry, db ethdb.KeyValueStore, groupDepth int) (common.Hash, trieNodeStats) {
 	if len(entries) == 0 {
 		return common.Hash{}, trieNodeStats{}
 	}
-	sb := &streamingBuilder{}
+	sb := &streamingBuilder{
+		groupDepth: groupDepth,
+	}
+	if groupDepth > 0 {
+		sb.groupBuf = make(map[int][]groupChild)
+	}
 	if db != nil {
 		sb.w = &trieNodeWriter{batch: db.NewBatch(), db: db}
 	}
@@ -526,8 +634,16 @@ func computeBinaryRootStreamingFromSlice(entries []trieEntry, db ethdb.KeyValueS
 // trie entries in a single forward pass. The iterator must yield entries
 // sorted by key (32 bytes each: key[0:31]=stem, key[31]=suffix).
 // Values are 32 bytes. O(depth) ≈ 8 KB memory for the stack.
-func computeBinaryRootStreaming(iter ethdb.Iterator, db ethdb.KeyValueStore) (common.Hash, trieNodeStats) {
-	sb := &streamingBuilder{}
+//
+// When groupDepth > 0, emits grouped-format InternalNodes at boundary
+// depths directly, eliminating the need for regroupTrieNodes().
+func computeBinaryRootStreaming(iter ethdb.Iterator, db ethdb.KeyValueStore, groupDepth int) (common.Hash, trieNodeStats) {
+	sb := &streamingBuilder{
+		groupDepth: groupDepth,
+	}
+	if groupDepth > 0 {
+		sb.groupBuf = make(map[int][]groupChild)
+	}
 	if db != nil {
 		sb.w = &trieNodeWriter{batch: db.NewBatch(), db: db}
 	}
@@ -571,3 +687,4 @@ func computeBinaryRootStreaming(iter ethdb.Iterator, db ethdb.KeyValueStore) (co
 
 	return root, tnStats
 }
+
