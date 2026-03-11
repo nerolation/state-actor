@@ -64,6 +64,10 @@ var (
 	// Output format
 	outputFormat = flag.String("output-format", "geth", "Output database format: 'geth' (Pebble) or 'erigon' (MDBX)")
 
+	// Binary trie group depth
+	groupDepth      = flag.Int("group-depth", 8, "Binary trie group depth (1-8, default 8). Controls serialization unit size.")
+	pebbleBlockSize = flag.Int("pebble-block-size", 4096, "PebbleDB SSTable block size in bytes (default 4096)")
+
 	// Stats server
 	statsPort = flag.Int("stats-port", 0, "Port for live stats HTTP server (0 = disabled)")
 )
@@ -197,7 +201,9 @@ func main() {
 			Depth:       *deepBranchDepth,
 			KnownSlots:  *deepBranchKnownSlots,
 		},
-		LiveStats: liveStats,
+		LiveStats:       liveStats,
+		GroupDepth:       *groupDepth,
+		PebbleBlockSize: *pebbleBlockSize,
 	}
 
 	// Load genesis if provided
@@ -254,6 +260,10 @@ func main() {
 		if config.CommitInterval > 0 {
 			log.Printf("  Commit Interval: %d trie insertions", config.CommitInterval)
 		}
+		if config.GroupDepth > 0 {
+			log.Printf("  Group Depth:     %d", config.GroupDepth)
+		}
+		log.Printf("  Pebble Block:    %d bytes", config.PebbleBlockSize)
 		if config.TargetSize > 0 {
 			log.Printf("  Target Size:  %s", formatBytes(config.TargetSize))
 		}

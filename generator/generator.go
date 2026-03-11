@@ -2,12 +2,14 @@ package generator
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log"
 	"math"
 	mrand "math/rand"
 	"os"
+	"runtime"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -573,6 +575,38 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 
 	// Note: We use g.writer (StateWriter) for final output, not batchWriter
 
+	// Snapshot writes happen in a background goroutine so they don't block
+	// the critical path (temp DB writes for Phase 2).
+	type snapshotWork struct {
+		acc *accountData
+	}
+	snapCh := make(chan snapshotWork, 64)
+	var snapErr atomic.Value // stores error
+	var snapWg sync.WaitGroup
+	snapWg.Add(1)
+	go func() {
+		defer snapWg.Done()
+		for sw := range snapCh {
+			if err := g.writeAccountSnapshot(sw.acc); err != nil {
+				snapErr.Store(err)
+				for range snapCh {
+				}
+				return
+			}
+		}
+	}()
+	var snapCloseOnce sync.Once
+	closeSnap := func() {
+		snapCloseOnce.Do(func() { close(snapCh) })
+	}
+	defer func() {
+		closeSnap()
+		snapWg.Wait()
+		if e := snapErr.Load(); e != nil && retErr == nil {
+			retErr = e.(error)
+		}
+	}()
+
 	// --- Phase 1: Generate data, write snapshots, write trie entries to temp DB ---
 	//
 	// Instead of collecting entries in an in-memory slice (which grows linearly
@@ -667,9 +701,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		if err := writeEntries(entryBuf); err != nil {
 			return nil, fmt.Errorf("failed to write genesis trie entries: %w", err)
 		}
-		if err := g.writeAccountSnapshot(ad); err != nil {
-			return nil, fmt.Errorf("failed to write genesis account %s: %w", addr.Hex(), err)
-		}
+		snapCh <- snapshotWork{acc: ad}
 
 		if len(ad.code) > 0 || len(ad.storage) > 0 {
 			stats.ContractsCreated++
@@ -705,9 +737,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 			addrHash: crypto.Keccak256Hash(addr[:]),
 			account:  injectAccount,
 		}
-		if err := g.writeAccountSnapshot(ad); err != nil {
-			return nil, fmt.Errorf("failed to write injected account %s: %w", addr.Hex(), err)
-		}
+		snapCh <- snapshotWork{acc: ad}
 		stats.AccountsCreated++
 		if g.config.Verbose {
 			log.Printf("Injected account %s with %s wei", addr.Hex(), injectBalance.String())
@@ -728,9 +758,7 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		if err := writeEntries(entryBuf); err != nil {
 			return nil, fmt.Errorf("failed to write EOA trie entries: %w", err)
 		}
-		if err := g.writeAccountSnapshot(acc); err != nil {
-			return nil, fmt.Errorf("failed to write EOA %d: %w", i, err)
-		}
+		snapCh <- snapshotWork{acc: acc}
 		stats.AccountsCreated++
 		if g.config.LiveStats != nil {
 			g.config.LiveStats.AddAccount()
@@ -788,13 +816,17 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 	contractIdx := 0
 	targetReached := false
 	for contract := range contractCh {
-		entryBuf = collectAccountEntries(contract.address, contract.account, len(contract.code), contract.code, contract.storage, entryBuf[:0])
-		if err := writeEntries(entryBuf); err != nil {
+		var entries []trieEntry
+		if len(contract.storage) >= parallelStorageThreshold {
+			entries = collectAccountEntriesParallel(contract.address, contract.account, len(contract.code), contract.code, contract.storage)
+		} else {
+			entryBuf = collectAccountEntries(contract.address, contract.account, len(contract.code), contract.code, contract.storage, entryBuf[:0])
+			entries = entryBuf
+		}
+		if err := writeEntries(entries); err != nil {
 			return nil, fmt.Errorf("failed to write contract trie entries: %w", err)
 		}
-		if err := g.writeAccountSnapshot(contract); err != nil {
-			return nil, fmt.Errorf("failed to write contract %d: %w", contractIdx, err)
-		}
+		snapCh <- snapshotWork{acc: contract}
 		stats.ContractsCreated++
 		stats.StorageSlotsCreated += len(contract.storage)
 		if g.config.LiveStats != nil {
@@ -848,11 +880,6 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		}
 	}
 
-	// Flush StateWriter
-	if err := g.writer.Flush(); err != nil {
-		return nil, fmt.Errorf("failed to flush writer: %w", err)
-	}
-
 	// --- Phase 2: Stream sorted entries from temp DB → compute root hash ---
 
 	// Compact the temp DB to flatten LSM levels into a single sorted run.
@@ -880,9 +907,31 @@ func (g *Generator) generateStreamingBinary() (retStats *Stats, retErr error) {
 		nodeDB = g.db
 	}
 	iter := tempDB.NewIterator(nil, nil)
-	stateRoot, tnStats := computeBinaryRootStreaming(iter, nodeDB)
+	numWorkers := runtime.GOMAXPROCS(0) - 2
+	if numWorkers < 2 {
+		numWorkers = 2
+	}
+	if g.config.Verbose {
+		log.Printf("Phase 2: using %d parallel workers", numWorkers)
+	}
+	stateRoot, tnStats, err := computeBinaryRootStreamingParallel(
+		context.Background(), iter, nodeDB, g.config.GroupDepth, numWorkers,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute binary root: %w", err)
+	}
 	if g.config.Verbose {
 		log.Printf("Computed binary trie root in %v", time.Since(hashStart).Round(time.Millisecond))
+	}
+
+	// Wait for snapshot writes to complete (they ran concurrently with Phase 2).
+	closeSnap()
+	snapWg.Wait()
+	if e := snapErr.Load(); e != nil {
+		return nil, fmt.Errorf("snapshot write failed: %w", e.(error))
+	}
+	if err := g.writer.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush writer: %w", err)
 	}
 
 	stats.StateRoot = stateRoot
